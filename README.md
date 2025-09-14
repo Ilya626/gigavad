@@ -4,7 +4,8 @@ Utilities for chunked speech transcription and voice activity detection.
 
 ## Features
 - **VADProcessor**: wrapper around [Silero VAD](https://github.com/snakers4/silero-vad) for
-  detecting speech segments.
+  detecting speech segments. Supports an optional ``model_dir`` parameter to
+  load pre-downloaded weights and avoid using ``torch.hub``.
 - **ChunkingProcessor**: splits long audio into manageable chunks based on
   energy and optional overlap.
 - **inference_gigaam.py**: command-line tool for transcribing long recordings
@@ -27,12 +28,14 @@ Transcribe a WAV file and obtain a JSON transcript:
 ```bash
 python inference_gigaam.py input.wav transcript.json \
     --model v2_rnnt --lang ru --chunk_sec 22 --overlap_sec 1.0
+# add --vad_silero --silero_model_dir /path/to/silero-vad to use local VAD
 ```
 
 To run plain VAD and save detected segments:
 
 ```bash
-python vad_example.py input.wav vad_output.txt
+# optionally provide a directory with silero-vad model.jit and utils_vad.py
+python vad_example.py input.wav vad_output.txt [model_dir]
 ```
 
 For punctuation restoration of per-segment JSONL:
