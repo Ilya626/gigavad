@@ -28,6 +28,7 @@ import time
 import tempfile
 import subprocess
 import shutil
+import io
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -428,13 +429,6 @@ def slice_with_silero_vad(
     return out, segs
 
 
-def _write_wav(tmpdir: Path, stem: str, audio: np.ndarray, sr: int, idx: int) -> Path:
-    """Write ``audio`` to a temporary WAV file and return its path."""
-    p = tmpdir / f"{stem}_chunk_{idx:05d}.wav"
-    sf.write(str(p), audio, sr)
-    return p
-
-
 def _dedup_suffix_prefix(prev_tail: str, new_text: str, min_overlap: int = 16) -> str:
     """
     Remove repeated prefix of new_text if it duplicates suffix of prev_tail.
@@ -475,6 +469,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
                                vad_pad_ms: int = 0,
                                silero_cuda: bool = False,
                                silero_model_dir: str = "",
+                               use_tempfile: bool = False,
                                ) -> tuple[str, list[dict], list[str]]:
     """Transcribe ``path`` sequentially and return full text and segment info."""
     src = _preconvert_if_needed(path, repo_root, force=False)
@@ -535,20 +530,42 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
             f"thr(abs={silence_abs}, peak_ratio={silence_peak_ratio})"
         )
 
-    tmpdir = Path(tempfile.gettempdir()) / "gigaam_chunks_seq"
-    tmpdir.mkdir(parents=True, exist_ok=True)
+    tmpdir = None
+    if use_tempfile:
+        tmpdir = Path(tempfile.gettempdir()) / "gigaam_chunks_seq"
+        tmpdir.mkdir(parents=True, exist_ok=True)
     full_text_parts: List[str] = []
     segments: List[dict] = []
 
     for i, (s0, s1) in enumerate(chunks):
         seg_audio = audio[s0:s1]
-        wav_path = _write_wav(tmpdir, path.stem, seg_audio, sr, i)
-        try:
-            with torch.inference_mode():
-                out = model.transcribe(str(wav_path), language=lang) if lang else model.transcribe(str(wav_path))
-        except TypeError:
-            with torch.inference_mode():
-                out = model.transcribe(str(wav_path))
+        if use_tempfile:
+            with tempfile.NamedTemporaryFile(
+                suffix=".wav", prefix=f"{path.stem}_chunk_", dir=tmpdir, delete=False
+            ) as tmpf:
+                sf.write(tmpf, seg_audio, sr, format="WAV")
+                wav_path = Path(tmpf.name)
+            try:
+                with torch.inference_mode():
+                    out = model.transcribe(str(wav_path), language=lang) if lang else model.transcribe(str(wav_path))
+            except TypeError:
+                with torch.inference_mode():
+                    out = model.transcribe(str(wav_path))
+            try:
+                wav_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        else:
+            buf = io.BytesIO()
+            sf.write(buf, seg_audio, sr, format="WAV")
+            buf.seek(0)
+            try:
+                with torch.inference_mode():
+                    out = model.transcribe(buf, language=lang) if lang else model.transcribe(buf)
+            except TypeError as e:
+                raise RuntimeError(
+                    "model.transcribe does not support file-like objects. Use --use_tempfile to enable legacy mode."
+                ) from e
 
         # extract text
         if isinstance(out, dict):
@@ -582,11 +599,6 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
             })
         else:
             segments.append({"start": s0 / sr, "end": s1 / sr, "text": ""})
-
-        try:
-            wav_path.unlink(missing_ok=True)
-        except Exception:
-            pass
 
         # free VRAM between chunks
         gc.collect()
@@ -682,6 +694,7 @@ def main():
     parser.add_argument("--write_segments_punct", type=str, default="", help="Optional JSONL to write segments with punctuation (text_punct)")
     parser.add_argument("--punct_ru", action="store_true", help="Apply RUPunct to segment texts and write text_punct")
     parser.add_argument("--no_lock", action="store_true", help="Do not acquire GPU lock")
+    parser.add_argument("--use_tempfile", action="store_true", help="Use legacy temp files for model input")
     parser.add_argument("--debug", action="store_true", help="Debug prints")
     args = parser.parse_args()
 
@@ -809,6 +822,7 @@ def main():
                     int(args.vad_pad_ms),
                     bool(args.silero_cuda),
                     args.silero_model_dir,
+                    bool(args.use_tempfile),
                 )
                 results[str(p)] = full_text
                 all_reports[str(p)] = comparison_lines
