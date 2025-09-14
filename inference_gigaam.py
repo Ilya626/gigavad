@@ -430,16 +430,51 @@ def slice_with_silero_vad(
 
 
 def _dedup_suffix_prefix(prev_tail: str, new_text: str, min_overlap: int = 16) -> str:
+    """Remove repeated prefix of ``new_text`` if it duplicates suffix of ``prev_tail``.
+
+    The comparison is performed on word tokens after Unicode normalization
+    (``NFKC``) and punctuation preprocessing so that visually similar text or
+    text with different punctuation/spacing still deduplicates correctly.
+    ``min_overlap`` denotes the minimal number of tokens that must overlap in
+    order to trigger deduplication.
     """
-    Remove repeated prefix of new_text if it duplicates suffix of prev_tail.
-    Case-insensitive, whitespace-normalized simple check.
-    """
-    a = " ".join(prev_tail.split()).lower()
-    b = " ".join(new_text.split()).lower()
-    max_k = min(len(a), len(b), 200)  # limit
+
+    import re
+    import unicodedata
+
+    def _normalize_tokens(text: str) -> list[str]:
+        text = unicodedata.normalize("NFKC", text)
+        # Replace punctuation with spaces before tokenization
+        text = "".join(
+            " " if unicodedata.category(ch).startswith("P") else ch for ch in text
+        )
+        return text.lower().split()
+
+    a_tokens = _normalize_tokens(prev_tail)
+    b_tokens = _normalize_tokens(new_text)
+    max_k = min(len(a_tokens), len(b_tokens), 200)  # safety limit
     for k in range(max_k, min_overlap - 1, -1):
-        if a.endswith(b[:k]):
-            return new_text[k:]
+        if a_tokens[-k:] == b_tokens[:k]:
+            # Determine character index in original new_text to cut from
+            norm_new = unicodedata.normalize("NFKC", new_text)
+            word_matches = list(re.finditer(r"\w+", norm_new))
+            if k > len(word_matches):
+                return ""
+            cut_norm = word_matches[k - 1].end()
+            # Skip any trailing punctuation or spaces
+            while cut_norm < len(norm_new) and not norm_new[cut_norm].isalnum():
+                cut_norm += 1
+            # Map normalized index back to original text index
+            idx_map: list[int] = []
+            for i, ch in enumerate(new_text):
+                norm_ch = unicodedata.normalize("NFKC", ch)
+                idx_map.extend([i] * len(norm_ch))
+            if cut_norm >= len(idx_map):
+                return ""
+            cut_orig = idx_map[cut_norm]
+            while cut_orig < len(new_text) and not new_text[cut_orig].isalnum():
+                cut_orig += 1
+            return new_text[cut_orig:]
     return new_text
 
 
@@ -685,7 +720,12 @@ def main():
 
     # dedup params
     parser.add_argument("--dedup_tail_chars", type=int, default=80, help="How many trailing chars from previous text to compare")
-    parser.add_argument("--min_dedup_overlap", type=int, default=16, help="Min overlap to consider as duplication")
+    parser.add_argument(
+        "--min_dedup_overlap",
+        type=int,
+        default=16,
+        help="Min token overlap to consider as duplication",
+    )
 
     # batching / misc
     parser.add_argument("--batch_size", type=int, default=16, help="Files per loop batch (I/O grouping)")
