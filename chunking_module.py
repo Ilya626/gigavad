@@ -22,7 +22,13 @@ class ChunkingProcessor:
         return self.slice_into_chunks(audio, sr)
 
     def _compute_energy_envelope(self, audio: np.ndarray, frame_len: int, hop_len: int) -> np.ndarray:
-        """Compute short-time RMS energy envelope for mono audio."""
+        """Compute short-time RMS energy envelope for mono audio.
+
+        The previous implementation used a Python loop to iterate over
+        frames.  Here we rely on ``numpy.lib.stride_tricks.sliding_window_view``
+        to construct all frames at once and compute the per-frame RMS value in
+        a vectorized fashion.
+        """
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
         n = len(audio)
@@ -30,14 +36,11 @@ class ChunkingProcessor:
             return np.zeros(0, dtype=np.float32)
         pad = (frame_len - (n - frame_len) % hop_len) % hop_len
         x = np.pad(audio.astype(np.float32, copy=False), (0, pad))
-        frames = 1 + (len(x) - frame_len) // hop_len
-        out = np.empty(frames, dtype=np.float32)
-        for i in range(frames):
-            s = i * hop_len
-            e = s + frame_len
-            w = x[s:e]
-            out[i] = float(np.sqrt(np.mean(w * w) + 1e-12))
-        return out
+        if len(x) < frame_len:
+            return np.zeros(0, dtype=np.float32)
+        windows = np.lib.stride_tricks.sliding_window_view(x, frame_len)[::hop_len]
+        out = np.sqrt(np.mean(windows * windows, axis=1) + 1e-12)
+        return out.astype(np.float32, copy=False)
 
     def _find_cut_near(self, target_samp: int, sr: int, env: np.ndarray,
                       frame_len: int, hop_len: int, search_sec: float, thr: float) -> int:
