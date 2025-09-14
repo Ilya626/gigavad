@@ -26,6 +26,7 @@ import gc
 import time
 import tempfile
 import subprocess
+import shutil
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -211,6 +212,12 @@ def _format_ts(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
+def _is_dense(text: str, dur: float) -> bool:
+    wps = len(text.split()) / max(dur, 1e-9)
+    cps = len(text) / max(dur, 1e-9)
+    return (wps >= 1.0) or (cps >= 3.0)
+
+
 # ------------------------- Audio I/O helpers -------------------------
 
 def _get_duration_sec(path: Path) -> Optional[float]:
@@ -356,10 +363,10 @@ def slice_with_silero_vad(
     max_overshoot_sec: float = 0.0,
     max_silence_within_sec: float = 1.2,
     min_bin_speech_sec: float = 0.0,
-    silero_threshold: float = 0.5,
-    silero_min_speech_ms: int = 150,
-    silero_min_silence_ms: int = 300,
-    silero_speech_pad_ms: int = 50,
+    silero_threshold: float = 0.65,
+    silero_min_speech_ms: int = 200,
+    silero_min_silence_ms: int = 250,
+    silero_speech_pad_ms: int = 35,
     use_cuda: bool = False,
     # splitting long speech segments
     cut_search_sec: float = 2.0,
@@ -377,6 +384,7 @@ def slice_with_silero_vad(
         min_speech_ms=silero_min_speech_ms,
         min_silence_ms=silero_min_silence_ms,
         speech_pad_ms=silero_speech_pad_ms,
+        max_speech_duration_s=target_speech_sec,
         use_cuda=use_cuda
     )
     segs = vad_processor.process(audio, sr)
@@ -439,100 +447,33 @@ def slice_with_silero_vad(
             refined.append((cur, e))
     segs = refined
 
-    # Pack segments into bins without splitting words
-    bins = []
-    current_bin = []
-    current_duration = 0.0
-    for seg in segs:
-        seg_duration = seg[1] - seg[0]
-        if current_duration + seg_duration <= target_speech_sec + max_overshoot_sec:
-            current_bin.append(seg)
-            current_duration += seg_duration
-        else:
-            if current_bin:
-                start = current_bin[0][0]
-                end = current_bin[-1][1]
-                bins.append((start, end))
-            current_bin = [seg]
-            current_duration = seg_duration
-    if current_bin:
-        start = current_bin[0][0]
-        end = current_bin[-1][1]
-        bins.append((start, end))
+    # Pack segments into bins considering gaps and max duration
+    bins: list[list[tuple[float, float]]] = []
+    cur_bin: list[tuple[float, float]] = []
+    cur_speech = 0.0
+    last_end = None
+    for s, e in segs:
+        seg_duration = e - s
+        if cur_bin:
+            gap = s - (last_end if last_end is not None else s)
+            if gap > max_silence_within_sec or (cur_speech + seg_duration) > (target_speech_sec + max_overshoot_sec):
+                bins.append(cur_bin)
+                cur_bin = []
+                cur_speech = 0.0
+        cur_bin.append((s, e))
+        cur_speech += seg_duration
+        last_end = e
+    if cur_bin:
+        bins.append(cur_bin)
+
     out: list[tuple[int, int]] = []
-    for s, e in bins:
-        ss = max(0, int(round(s * sr)))
-        ee = max(ss + 1, int(round(e * sr)))
+    for bin_segs in bins:
+        start = bin_segs[0][0]
+        end = bin_segs[-1][1]
+        ss = max(0, int(round(start * sr)))
+        ee = max(ss + 1, int(round(end * sr)))
         out.append((ss, ee))
-    return out
-
-
-# ------------------------- Silero VAD chunking -------------------------
-
-def _silero_vad_segments(
-    audio: np.ndarray,
-    sr: int,
-    threshold: float = 0.5,
-    min_speech_ms: int = 150,
-    min_silence_ms: int = 300,
-    speech_pad_ms: int = 50,
-    max_speech_sec: float | None = None,
-    device: str | None = None,
-) -> list[tuple[float, float]]:
-    """Use Silero VAD via torch.hub to return speech segments in seconds.
-
-    Works fully on CPU; CUDA is optional.
-    """
-    if not _HAVE_TORCH:
-        raise RuntimeError("PyTorch not available for Silero VAD")
-
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    if sr != 16000:
-        # Silero expects 16k; but our pipeline preconverts to 16k mono. Just warn.
-        pass
-
-    import torch
-    try:
-        model, utils = torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True)
-        get_speech_timestamps, _, read_audio, _, collect_chunks = utils
-    except Exception as e:
-        raise RuntimeError(f"Failed to load Silero VAD from torch.hub: {e}")
-
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    try:
-        model = model.to(device)
-    except Exception:
-        pass
-
-    wav_t = torch.from_numpy(audio.astype(np.float32, copy=False))
-    if device == 'cuda':
-        wav_t = wav_t.to(device)
-
-    kwargs = dict(
-        sampling_rate=sr,
-        threshold=float(threshold),
-        min_speech_duration_ms=int(min_speech_ms),
-        min_silence_duration_ms=int(min_silence_ms),
-        speech_pad_ms=int(speech_pad_ms),
-        return_seconds=True,
-    )
-    if max_speech_sec is not None and max_speech_sec > 0:
-        kwargs['max_speech_duration_s'] = float(max_speech_sec)
-
-    try:
-        ts = get_speech_timestamps(wav_t, model, **kwargs)
-    except Exception as e:
-        raise RuntimeError(f"Silero VAD inference failed: {e}")
-
-    out: list[tuple[float, float]] = []
-    for seg in ts:
-        st = float(seg.get('start', 0.0))
-        en = float(seg.get('end', 0.0))
-        if en > st:
-            out.append((st, en))
-    return out
+    return out, segs
 
 
 def _write_wav(tmpdir: Path, stem: str, audio: np.ndarray, sr: int, idx: int) -> Path:
@@ -572,10 +513,10 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
                                vad_min_bin_speech: float = 10.0,
                                vad_cut_search_sec: float = 2.0,
                                vad_min_gap_sec: float = 0.3,
-                               silero_threshold: float = 0.5,
-                               silero_min_speech_ms: int = 150,
-                               silero_min_silence_ms: int = 300,
-                               silero_speech_pad_ms: int = 50,
+                               silero_threshold: float = 0.65,
+                               silero_min_speech_ms: int = 200,
+                               silero_min_silence_ms: int = 250,
+                               silero_speech_pad_ms: int = 35,
                                silero_cuda: bool = False,
                                ) -> tuple[str, list[dict], list[str]]:
     """
@@ -591,9 +532,10 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
 
     # Prefer VAD-based chunking when requested
     chunks = None
+    speech_secs: list[tuple[float, float]] | None = None
     if use_vad_silero:
         try:
-            chunks = slice_with_silero_vad(
+            chunks, speech_secs = slice_with_silero_vad(
                 src,
                 sr,
                 audio,
@@ -663,13 +605,16 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
         # deduplicate overlap
         tail = "".join(full_text_parts)[-dedup_tail_chars:] if full_text_parts else ""
         text = _dedup_suffix_prefix(tail, text, min_overlap=min_dedup_overlap)
-        if text:
+        dur = (s1 - s0) / sr
+        if text and _is_dense(text, dur):
             full_text_parts.append(text)
             segments.append({
                 "start": s0 / sr,
                 "end": s1 / sr,
                 "text": text,
             })
+        else:
+            segments.append({"start": s0 / sr, "end": s1 / sr, "text": ""})
 
         try:
             wav_path.unlink(missing_ok=True)
@@ -684,16 +629,11 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
             pass
 
     full_text = " ".join([t for t in full_text_parts if t]).strip()
-    
-    # Save segments in vad_hand_results_6m.txt format for comparison
-    comparison_lines = []
-    for seg in segments:
-        start = seg["start"]
-        end = seg["end"]
-        # Determine segment type (Voice/Noise) based on text content
-        seg_type = "Голос" if seg["text"].strip() else "Шум"
-        comparison_lines.append(f"{start:.1f}-{end:.1f} {seg_type}")
-    
+
+    comparison_lines: list[str] = []
+    if speech_secs:
+        for s, e in speech_secs:
+            comparison_lines.append(f"{s:.1f}-{e:.1f} Голос")
     return full_text, segments, comparison_lines
 
 
@@ -702,8 +642,6 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
 
 
 # ------------------------- CLI -------------------------
-
-import shutil  # after functions to avoid linter noise
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -734,10 +672,10 @@ def main():
 
     # Silero VAD options (Windows-friendly, no Triton)
     parser.add_argument("--vad_silero", action="store_true", help="Use Silero VAD (torch.hub) for chunking into ~22s speech bins")
-    parser.add_argument("--silero_threshold", type=float, default=0.5, help="Silero VAD threshold")
-    parser.add_argument("--silero_min_speech_ms", type=int, default=150, help="Minimum speech duration in ms")
-    parser.add_argument("--silero_min_silence_ms", type=int, default=300, help="Minimum silence to separate speech in ms")
-    parser.add_argument("--silero_speech_pad_ms", type=int, default=50, help="Padding around detected speech in ms")
+    parser.add_argument("--silero_threshold", type=float, default=0.65, help="Silero VAD threshold")
+    parser.add_argument("--silero_min_speech_ms", type=int, default=200, help="Minimum speech duration in ms")
+    parser.add_argument("--silero_min_silence_ms", type=int, default=250, help="Minimum silence to separate speech in ms")
+    parser.add_argument("--silero_speech_pad_ms", type=int, default=35, help="Padding around detected speech in ms")
     parser.add_argument("--silero_cuda", action="store_true", help="Run Silero VAD on CUDA if available")
 
     # dedup params
@@ -829,6 +767,7 @@ def main():
 
     # Transcribe
     results: dict[str, str] = {}
+    all_reports: dict[str, list[str]] = {}
     seg_writer = None
     seg_writer_punct = None
     rupunct = None
@@ -875,6 +814,7 @@ def main():
                     bool(args.silero_cuda),
                 )
                 results[str(p)] = full_text
+                all_reports[str(p)] = comparison_lines
                 if (seg_writer or seg_writer_punct) and segments:
                     for s in segments:
                         base_obj = {
@@ -917,8 +857,9 @@ def main():
             report_path = Path(args.output_report)
             report_path.parent.mkdir(parents=True, exist_ok=True)
             with report_path.open("w", encoding="utf-8") as f:
-                for line in comparison_lines:
-                    f.write(f"{line}\n")
+                for lines in all_reports.values():
+                    for line in lines:
+                        f.write(f"{line}\n")
     finally:
         if seg_writer:
             seg_writer.close()

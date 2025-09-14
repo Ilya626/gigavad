@@ -1,14 +1,23 @@
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 import torch
 
+
 class VADProcessor:
-    def __init__(self, threshold=0.5, min_speech_ms=150, min_silence_ms=300, 
-                 speech_pad_ms=50, use_cuda=False):
+    def __init__(
+        self,
+        threshold: float = 0.65,
+        min_speech_ms: int = 200,
+        min_silence_ms: int = 250,
+        speech_pad_ms: int = 35,
+        max_speech_duration_s: float = 22.0,
+        use_cuda: bool = False,
+    ):
         self.threshold = threshold
         self.min_speech_ms = min_speech_ms
         self.min_silence_ms = min_silence_ms
         self.speech_pad_ms = speech_pad_ms
+        self.max_speech_duration_s = max_speech_duration_s
         self.use_cuda = use_cuda
         self.model = self._load_model()
 
@@ -29,7 +38,8 @@ class VADProcessor:
         return model.to(device)
 
     def process(self, audio: np.ndarray, sr: int) -> List[Tuple[float, float]]:
-        return self._silero_vad_segments(audio, sr)
+        segs_raw = self._silero_vad_segments(audio, sr)
+        return [(float(s["start"]), float(s["end"])) for s in segs_raw]
 
     def _silero_vad_segments(self, audio: np.ndarray, sr: int) -> List[Tuple[float, float]]:
         if audio.ndim > 1:
@@ -44,5 +54,6 @@ class VADProcessor:
             min_speech_duration_ms=self.min_speech_ms,
             min_silence_duration_ms=self.min_silence_ms,
             speech_pad_ms=self.speech_pad_ms,
-            return_seconds=True
+            max_speech_duration_s=self.max_speech_duration_s,
+            return_seconds=True,
         )
