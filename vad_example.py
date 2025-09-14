@@ -16,11 +16,11 @@ def main(input_wav: str, output_txt: str):
         
         # Process with VAD
         vad = VADProcessor(
-            threshold=0.3,
-            min_speech_ms=100,
-            min_silence_ms=200,
-            speech_pad_ms=30,
-            use_cuda=False
+            threshold=0.65,
+            min_speech_ms=200,
+            min_silence_ms=250,
+            speech_pad_ms=35,
+            use_cuda=False,
         )
         segments = vad.process(audio, sr)
         print(f"Detected {len(segments)} speech segments")
