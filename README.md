@@ -29,7 +29,12 @@ Transcribe a WAV file and obtain a JSON transcript:
 python inference_gigaam.py input.wav transcript.json \
     --model v2_rnnt --lang ru --chunk_sec 22 --overlap_sec 1.0
 # add --vad_silero --silero_model_dir /path/to/silero-vad to use local VAD
+# use --vad_pad_ms to extend VAD segments and avoid cutting words at boundaries
 ```
+
+Increasing `--vad_pad_ms` adds the specified milliseconds of context before and
+after every VAD segment prior to bin packing. This extra margin helps prevent
+words from being truncated at chunk boundaries, improving boundary safety.
 
 To run plain VAD and save detected segments:
 

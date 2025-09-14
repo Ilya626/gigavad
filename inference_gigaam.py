@@ -15,7 +15,7 @@ Example:
   python inference_gigaam_chunked.py Ilya_1_h.wav out/transcript.json \
     --model v2_rnnt --lang ru --chunk_sec 22 --overlap_sec 1.5 \
     --silence_peak_ratio 0.002 --write_segments out/segments.jsonl --debug
-    # optionally add: --vad_silero --silero_model_dir /path/to/silero-vad
+    # optionally add: --vad_silero --vad_pad_ms 200 --silero_model_dir /path/to/silero-vad
 """
 
 import argparse
@@ -297,6 +297,7 @@ def slice_with_silero_vad(
     silero_min_speech_ms: int = 200,
     silero_min_silence_ms: int = 250,
     silero_speech_pad_ms: int = 35,
+    pad_context_ms: int = 0,
     use_cuda: bool = False,
     # splitting long speech segments
     cut_search_sec: float = 2.0,
@@ -308,6 +309,13 @@ def slice_with_silero_vad(
 ) -> List[Tuple[int, int]]:
     """Compute chunks via Silero VAD, then pack into ~22s speech bins, strict <= target.
     Splits long speech regions at internal pauses >= min_gap_sec using energy if needed.
+
+    Parameters
+    ----------
+    pad_context_ms:
+        Extra padding applied to each detected speech segment before bin packing
+        (milliseconds). Provides additional context to reduce the risk of
+        cutting words at bin boundaries.
     """
     # Use VADProcessor for Silero VAD
     vad_processor = VADProcessor(
@@ -343,6 +351,17 @@ def slice_with_silero_vad(
             end_t = s + ee / sr
             refined.append((start_t, min(end_t, e)))
     segs = refined
+
+    # expand each segment for boundary safety
+    if pad_context_ms > 0:
+        pad = pad_context_ms / 1000.0
+        total_dur = len(audio) / sr
+        padded: list[tuple[float, float]] = []
+        for s, e in segs:
+            s = max(0.0, s - pad)
+            e = min(total_dur, e + pad)
+            padded.append((s, e))
+        segs = padded
 
     # Pack segments into bins considering gaps and max duration
     bins: list[list[tuple[float, float]]] = []
@@ -415,6 +434,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
                                silero_min_speech_ms: int = 200,
                                silero_min_silence_ms: int = 250,
                                silero_speech_pad_ms: int = 35,
+                               vad_pad_ms: int = 0,
                                silero_cuda: bool = False,
                                silero_model_dir: str = "",
                                ) -> tuple[str, list[dict], list[str]]:
@@ -444,6 +464,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
                 silero_min_speech_ms=int(silero_min_speech_ms),
                 silero_min_silence_ms=int(silero_min_silence_ms),
                 silero_speech_pad_ms=int(silero_speech_pad_ms),
+                pad_context_ms=int(vad_pad_ms),
                 use_cuda=bool(silero_cuda),
                 cut_search_sec=float(vad_cut_search_sec),
                 min_gap_sec=float(vad_min_gap_sec),
@@ -576,6 +597,8 @@ def main():
     parser.add_argument("--vad_min_bin_speech", type=float, default=10.0, help="Min speech per bin before early close (sec)")
     parser.add_argument("--vad_min_gap_sec", type=float, default=0.3, help="Minimum internal pause to split long speech (sec)")
     parser.add_argument("--vad_cut_search_sec", type=float, default=2.0, help="Search window around target for internal pause cut (sec)")
+    parser.add_argument("--vad_pad_ms", type=int, default=0,
+                        help="Padding added to each VAD segment before binning (ms)")
 
     # Silero VAD options (Windows-friendly, no Triton)
     parser.add_argument("--vad_silero", action="store_true", help="Use Silero VAD (torch.hub) for chunking into ~22s speech bins")
@@ -719,6 +742,7 @@ def main():
                     int(args.silero_min_speech_ms),
                     int(args.silero_min_silence_ms),
                     int(args.silero_speech_pad_ms),
+                    int(args.vad_pad_ms),
                     bool(args.silero_cuda),
                     args.silero_model_dir,
                 )
