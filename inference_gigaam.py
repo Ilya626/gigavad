@@ -15,6 +15,7 @@ Example:
   python inference_gigaam_chunked.py Ilya_1_h.wav out/transcript.json \
     --model v2_rnnt --lang ru --chunk_sec 22 --overlap_sec 1.5 \
     --silence_peak_ratio 0.002 --write_segments out/segments.jsonl --debug
+    # optionally add: --vad_silero --silero_model_dir /path/to/silero-vad
 """
 
 import argparse
@@ -386,6 +387,7 @@ def slice_with_silero_vad(
     frame_ms: float = 20.0,
     silence_abs: float = 0.0,
     silence_peak_ratio: float = 0.002,
+    silero_model_dir: Optional[str] = None,
 ) -> List[Tuple[int, int]]:
     """Compute chunks via Silero VAD, then pack into ~22s speech bins, strict <= target.
     Splits long speech regions at internal pauses >= min_gap_sec using energy if needed.
@@ -397,7 +399,8 @@ def slice_with_silero_vad(
         min_silence_ms=silero_min_silence_ms,
         speech_pad_ms=silero_speech_pad_ms,
         max_speech_duration_s=target_speech_sec,
-        use_cuda=use_cuda
+        use_cuda=use_cuda,
+        model_dir=silero_model_dir,
     )
     segs = vad_processor.process(audio, sr)
 
@@ -531,6 +534,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
                                silero_min_silence_ms: int = 250,
                                silero_speech_pad_ms: int = 35,
                                silero_cuda: bool = False,
+                               silero_model_dir: str = "",
                                ) -> tuple[str, list[dict], list[str]]:
     """Transcribe ``path`` sequentially and return full text and segment info."""
     src = _preconvert_if_needed(path, repo_root, force=False)
@@ -564,6 +568,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
                 frame_ms=float(frame_ms),
                 silence_abs=float(silence_abs),
                 silence_peak_ratio=float(silence_peak_ratio),
+                silero_model_dir=silero_model_dir,
             )
         except Exception as e:
             print(f"[VAD][Silero] failed ({e}); falling back to energy-based slicing.")
@@ -689,6 +694,7 @@ def main():
     parser.add_argument("--silero_min_silence_ms", type=int, default=250, help="Minimum silence to separate speech in ms")
     parser.add_argument("--silero_speech_pad_ms", type=int, default=35, help="Padding around detected speech in ms")
     parser.add_argument("--silero_cuda", action="store_true", help="Run Silero VAD on CUDA if available")
+    parser.add_argument("--silero_model_dir", type=str, default="", help="Directory with local Silero VAD model")
 
     # dedup params
     parser.add_argument("--dedup_tail_chars", type=int, default=80, help="How many trailing chars from previous text to compare")
@@ -824,6 +830,7 @@ def main():
                     int(args.silero_min_silence_ms),
                     int(args.silero_speech_pad_ms),
                     bool(args.silero_cuda),
+                    args.silero_model_dir,
                 )
                 results[str(p)] = full_text
                 all_reports[str(p)] = comparison_lines

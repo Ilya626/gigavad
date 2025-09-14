@@ -6,8 +6,18 @@ import soundfile as sf
 from vad_module import VADProcessor
 
 
-def main(input_wav: str, output_txt: str):
-    """Run VAD on ``input_wav`` and write labeled segments to ``output_txt``."""
+def main(input_wav: str, output_txt: str, model_dir: str | None = None):
+    """Run VAD on ``input_wav`` and write labeled segments to ``output_txt``.
+
+    Parameters
+    ----------
+    input_wav: str
+        Path to the input WAV file.
+    output_txt: str
+        Path where the segment labels will be written.
+    model_dir: str | None
+        Optional path to directory with pre-downloaded Silero VAD weights.
+    """
     try:
         # Проверка существования входного файла
         input_path = Path(input_wav)
@@ -25,6 +35,7 @@ def main(input_wav: str, output_txt: str):
             min_silence_ms=250,
             speech_pad_ms=35,
             use_cuda=False,
+            model_dir=model_dir,
         )
         segments = vad.process(audio, sr)
         print(f"Detected {len(segments)} speech segments")
@@ -46,10 +57,11 @@ def main(input_wav: str, output_txt: str):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python vad_example.py input.wav output.txt")
+    if len(sys.argv) not in {3, 4}:
+        print("Usage: python vad_example.py input.wav output.txt [model_dir]")
         sys.exit(1)
 
-    main(sys.argv[1], sys.argv[2])
+    mdl = sys.argv[3] if len(sys.argv) == 4 else None
+    main(sys.argv[1], sys.argv[2], mdl)
     print(f"VAD results saved to {sys.argv[2]}")
     print("Compare with: diff -y vad_output.txt vad_hand_results_6m.txt")
