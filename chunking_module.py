@@ -13,6 +13,8 @@ class ChunkingProcessor:
         Target chunk length in seconds.
     overlap_sec:
         Overlap between consecutive chunks in seconds.
+    min_chunk_sec:
+        Minimum allowed chunk length in seconds.
     search_silence_sec:
         Radius around a boundary to search for a lower-energy cut.
     silence_abs:
@@ -27,11 +29,13 @@ class ChunkingProcessor:
     """
 
     def __init__(self, chunk_sec=22.0, overlap_sec=1.0,
+                 min_chunk_sec: float = 3.0,
                  search_silence_sec=0.6, silence_abs=0.0,
                  silence_peak_ratio=0.002, frame_ms=20.0,
                  adaptive: bool = True):
         self.chunk_sec = chunk_sec
         self.overlap_sec = overlap_sec
+        self.min_chunk_sec = min_chunk_sec
         self.search_silence_sec = search_silence_sec
         self.silence_abs = silence_abs
         self.silence_peak_ratio = silence_peak_ratio
@@ -104,7 +108,7 @@ class ChunkingProcessor:
 
         chunk_len = int(round(self.chunk_sec * sr))
         overlap = int(round(self.overlap_sec * sr))
-        min_len = int(round(3.0 * sr))  # минимальная длина чанка 3 секунды
+        min_len = int(round(self.min_chunk_sec * sr))  # минимальная длина чанка в секундах
         search_sec = float(self.search_silence_sec)
 
         chunks: List[Tuple[int, int]] = []
