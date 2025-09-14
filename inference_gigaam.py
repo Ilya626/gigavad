@@ -286,7 +286,6 @@ def _preconvert_if_needed(path: Path, repo_root: Path, force: bool = False) -> P
 
 
 def slice_with_silero_vad(
-    audio_path: Path,
     sr: int,
     audio: np.ndarray,
     target_speech_sec: float = 22.0,
@@ -307,15 +306,18 @@ def slice_with_silero_vad(
     silence_peak_ratio: float = 0.002,
     silero_model_dir: Optional[str] = None,
 ) -> List[Tuple[int, int]]:
-    """Compute chunks via Silero VAD, then pack into ~22s speech bins, strict <= target.
-    Splits long speech regions at internal pauses >= min_gap_sec using energy if needed.
+    """Compute chunks via Silero VAD and pack them into ≈22 s speech bins.
 
     Parameters
     ----------
+    sr:
+        Sample rate of ``audio``.
+    audio:
+        Mono audio samples.
     pad_context_ms:
-        Extra padding applied to each detected speech segment before bin packing
-        (milliseconds). Provides additional context to reduce the risk of
-        cutting words at bin boundaries.
+        Extra padding applied to each detected speech segment before bin
+        packing (milliseconds). Provides additional context to reduce the risk
+        of cutting words at bin boundaries.
     """
     # Use VADProcessor for Silero VAD
     vad_processor = VADProcessor(
@@ -453,7 +455,6 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
     if use_vad_silero:
         try:
             chunks, speech_secs = slice_with_silero_vad(
-                src,
                 sr,
                 audio,
                 target_speech_sec=float(target_speech_sec),
