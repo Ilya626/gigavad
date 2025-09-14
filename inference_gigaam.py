@@ -1,0 +1,940 @@
+﻿#!/usr/bin/env python
+from __future__ import annotations
+
+"""
+Chunked transcription for Salute GigaAM (no pyannote needed).
+
+- Cuts long audio into short chunks (by energy/silence), with overlap.
+- Feeds chunks sequentially to model.transcribe.
+- Deduplicates boundary repeats.
+- Works on single files, dirs, or JSON/JSONL manifests.
+- Outputs a JSON { "input_path": "full text" }.
+- Optional: write JSONL with segments [start,end,text].
+
+Example:
+  python inference_gigaam_chunked.py Ilya_1_h.wav out/transcript.json \
+    --model v2_rnnt --lang ru --chunk_sec 22 --overlap_sec 1.5 \
+    --silence_peak_ratio 0.002 --write_segments out/segments.jsonl --debug
+"""
+
+import argparse
+import json
+import math
+import os
+import sys
+import gc
+import time
+import tempfile
+import subprocess
+from pathlib import Path
+from typing import List, Tuple, Optional
+
+import numpy as np
+import soundfile as sf
+from vad_module import VADProcessor
+from chunking_module import ChunkingProcessor
+
+try:
+    import torch
+except Exception as e:
+    raise SystemExit(f"PyTorch is required: {e}")
+
+try:
+    import gigaam  # type: ignore
+except Exception as e:
+    gigaam = None  # type: ignore
+    _IMPORT_ERR = e
+
+# Optional RUPunct integration for inline punctuation of segments
+_HAVE_TRANSFORMERS = False
+try:
+    from transformers import pipeline as _hf_pipeline, AutoTokenizer as _AutoTokenizer  # type: ignore
+    _HAVE_TRANSFORMERS = True
+except Exception:
+    _HAVE_TRANSFORMERS = False
+
+def _build_rupunct_pipeline(model_id: str = "RUPunct/RUPunct_big"):
+    if not _HAVE_TRANSFORMERS:
+        raise RuntimeError("transformers not available for RUPunct")
+    tk = _AutoTokenizer.from_pretrained(model_id, strip_accents=False, add_prefix_space=True)
+    clf = _hf_pipeline("ner", model=model_id, tokenizer=tk, aggregation_strategy="first")
+    return clf
+
+def _rupunct_process_token(token: str, label: str) -> str:
+    # Mirror mapping from rupunct_apply.py
+    mapping = {
+        "LOWER_O": "",
+        "LOWER_PERIOD": ".",
+        "LOWER_COMMA": ",",
+        "LOWER_QUESTION": "?",
+        "LOWER_TIRE": " —",
+        "LOWER_DVOETOCHIE": ":",
+        "LOWER_VOSKL": "!",
+        "LOWER_PERIODCOMMA": ";",
+        "LOWER_DEFIS": "-",
+        "LOWER_MNOGOTOCHIE": "...",
+        "LOWER_QUESTIONVOSKL": "?!",
+    }
+    upper_map = {
+        "UPPER_O": (True, ""),
+        "UPPER_PERIOD": (True, "."),
+        "UPPER_COMMA": (True, ","),
+        "UPPER_QUESTION": (True, "?"),
+        "UPPER_TIRE": (True, " —"),
+        "UPPER_DVOETOCHIE": (True, ":"),
+        "UPPER_VOSKL": (True, "!"),
+        "UPPER_PERIODCOMMA": (True, ";"),
+        "UPPER_DEFIS": (True, "-"),
+        "UPPER_MNOGOTOCHIE": (True, "..."),
+        "UPPER_QUESTIONVOSKL": (True, "?!"),
+    }
+    upper_total_map = {
+        "UPPER_TOTAL_O": (str.upper, ""),
+        "UPPER_TOTAL_PERIOD": (str.upper, "."),
+        "UPPER_TOTAL_COMMA": (str.upper, ","),
+        "UPPER_TOTAL_QUESTION": (str.upper, "?"),
+        "UPPER_TOTAL_TIRE": (str.upper, " —"),
+        "UPPER_TOTAL_DVOETOCHIE": (str.upper, ":"),
+        "UPPER_TOTAL_VOSKL": (str.upper, "!"),
+        "UPPER_TOTAL_PERIODCOMMA": (str.upper, ";"),
+        "UPPER_TOTAL_DEFIS": (str.upper, "-"),
+        "UPPER_TOTAL_MNOGOTOCHIE": (str.upper, "..."),
+        "UPPER_TOTAL_QUESTIONVOSKL": (str.upper, "?!"),
+    }
+    if label in mapping:
+        return token + mapping[label]
+    if label in upper_map:
+        cap, p = upper_map[label]
+        return token.capitalize() + p
+    if label in upper_total_map:
+        fn, p = upper_total_map[label]
+        return fn(token) + p
+    return token
+
+def _rupunct_fix_spaces(text: str) -> str:
+    import re as _re
+    rules = [
+        (_re.compile(r"\s+([,.;:!?—])"), r"\1"),
+        (_re.compile(r"\s+—\s*"), " — "),
+        (_re.compile(r"\s{2,}"), " "),
+    ]
+    out = text.strip()
+    for rx, rep in rules:
+        out = rx.sub(rep, out)
+    return out.strip()
+
+def _rupunct_text(clf, text: str) -> str:
+    if not text or not text.strip():
+        return text
+    preds = clf(text)
+    parts = []
+    for it in preds:
+        token = (it.get("word") or "").strip()
+        label = it.get("entity_group") or "LOWER_O"
+        parts.append(_rupunct_process_token(token, label))
+    return _rupunct_fix_spaces(" ".join(parts))
+
+
+# ------------------------- Utilities & Env -------------------------
+
+def configure_local_caches() -> Path:
+    repo_root = Path(__file__).resolve().parents[1]
+    os.environ.setdefault("TORCH_HOME", str(repo_root / ".torch"))
+    tmp = str(repo_root / ".tmp")
+    os.environ.setdefault("TMP", tmp)
+    os.environ.setdefault("TEMP", tmp)
+    Path(os.environ["TORCH_HOME"]).mkdir(parents=True, exist_ok=True)
+    Path(tmp).mkdir(parents=True, exist_ok=True)
+    return repo_root
+
+
+def require_cuda():
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required. CPU inference is disabled.")
+
+
+def vram_report(tag: str) -> None:
+    try:
+        dev = torch.cuda.current_device()
+        total = torch.cuda.get_device_properties(dev).total_memory
+        free, _ = torch.cuda.mem_get_info()
+        alloc = torch.cuda.memory_allocated(dev)
+        reserv = torch.cuda.memory_reserved(dev)
+        gb = 1024 ** 3
+        print(f"[VRAM:{tag}] alloc={alloc/gb:.2f}G reserved={reserv/gb:.2f}G free={free/gb:.2f}G total={total/gb:.2f}G")
+    except Exception:
+        pass
+
+
+def acquire_gpu_lock(lock_path: Path, timeout_s: int = 120) -> tuple[bool, int]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    pid = os.getpid()
+    start = time.time()
+    while time.time() - start < timeout_s:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(str(pid))
+            print(f"[LOCK] Acquired GPU lock at {lock_path}")
+            return True, pid
+        except FileExistsError:
+            time.sleep(1)
+        except Exception:
+            time.sleep(1)
+    return False, pid
+
+
+def release_gpu_lock(lock_path: Path, owner_pid: int) -> None:
+    try:
+        if lock_path.exists():
+            try:
+                content = lock_path.read_text(encoding="utf-8").strip()
+            except Exception:
+                content = ""
+            if content == str(owner_pid):
+                lock_path.unlink(missing_ok=True)
+                print(f"[LOCK] Released GPU lock at {lock_path}")
+    except Exception:
+        pass
+
+
+def _format_ts(sec: float) -> str:
+    if sec < 0:
+        sec = 0.0
+    ms = int(round(sec * 1000))
+    h = ms // 3_600_000
+    ms %= 3_600_000
+    m = ms // 60_000
+    ms %= 60_000
+    s = ms // 1000
+    ms %= 1000
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+# ------------------------- Audio I/O helpers -------------------------
+
+def _get_duration_sec(path: Path) -> Optional[float]:
+    try:
+        info = sf.info(str(path))
+        if info.samplerate and info.frames:
+            return float(info.frames) / float(info.samplerate)
+    except Exception:
+        pass
+    return None
+
+
+def _preconvert_if_needed(path: Path, repo_root: Path, force: bool = False) -> Path:
+    """Ensure mono 16k PCM16 WAV using ffmpeg; convert MP3/FLAC/etc. or mismatched WAV."""
+    ext = path.suffix.lower()
+    needs = force or ext in {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wma", ".mp4", ".flac"}
+    if not needs and ext == ".wav":
+        try:
+            info = sf.info(str(path))
+            subtype = getattr(info, "subtype", "") or ""
+            if info.channels != 1 or info.samplerate != 16000 or "PCM_16" not in subtype:
+                needs = True
+        except Exception:
+            needs = True
+
+    if not needs:
+        return path
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        # fallback: try to write as-is; model may still cope
+        return path
+
+    out_dir = repo_root / ".tmp" / "gigaam_pre"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{path.stem}_16k_mono.wav"
+
+    cmd = [
+        ffmpeg, "-y", "-i", str(path),
+        "-ac", "1", "-ar", "16000", "-vn", "-acodec", "pcm_s16le",
+        str(out_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return out_path
+    except Exception:
+        return path
+
+
+# ------------------------- Chunking logic (no VAD deps) -------------------------
+
+def _compute_energy_envelope(audio: np.ndarray, frame_len: int, hop_len: int) -> np.ndarray:
+    """Short-time RMS energy envelope."""
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    n = len(audio)
+    if n <= 0:
+        return np.zeros(0, dtype=np.float32)
+    # Pad left/right to fit frames
+    pad = (frame_len - (n - frame_len) % hop_len) % hop_len
+    x = np.pad(audio.astype(np.float32, copy=False), (0, pad))
+    frames = 1 + (len(x) - frame_len) // hop_len
+    out = np.empty(frames, dtype=np.float32)
+    for i in range(frames):
+        s = i * hop_len
+        e = s + frame_len
+        w = x[s:e]
+        out[i] = float(np.sqrt(np.mean(w * w) + 1e-12))
+    return out
+
+
+def _find_cut_near(target_samp: int, sr: int, env: np.ndarray, frame_len: int, hop_len: int,
+                   search_sec: float, thr: float) -> int:
+    """Search for lowest-energy frame near target and cut there if below thr; else target."""
+    if target_samp <= 0:
+        return 0
+    target_frame = max(0, min(len(env) - 1, target_samp // hop_len))
+    radius = max(1, int(round(search_sec * sr / hop_len)))
+    lo = max(0, target_frame - radius)
+    hi = min(len(env) - 1, target_frame + radius)
+    window = env[lo:hi + 1]
+    if window.size == 0:
+        return target_samp
+    idx_rel = int(np.argmin(window))
+    if window[idx_rel] <= thr:
+        best_frame = lo + idx_rel
+        return best_frame * hop_len
+    return target_samp
+
+
+def slice_into_chunks(audio: np.ndarray, sr: int,
+                      chunk_sec: float, overlap_sec: float,
+                      search_silence_sec: float,
+                      silence_abs: float,
+                      silence_peak_ratio: float,
+                      frame_ms: float,
+                      min_chunk_sec: float = 3.0) -> List[Tuple[int, int]]:
+    """
+    Create chunk [start,end) sample indices with overlap, seeking silence near boundaries.
+    Silence threshold is max(silence_abs, global_peak * silence_peak_ratio).
+    """
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    n = len(audio)
+    if n == 0:
+        return []
+
+    frame_len = max(1, int(round(sr * frame_ms / 1000.0)))
+    hop_len = frame_len // 2  # 50% overlap for smoother envelope
+    env = _compute_energy_envelope(audio, frame_len, hop_len)
+    peak = float(np.max(np.abs(audio))) if n else 0.0
+    thr = max(1e-7, float(silence_abs) if silence_abs > 0 else peak * float(silence_peak_ratio))
+
+    chunk_len = int(round(chunk_sec * sr))
+    overlap = int(round(overlap_sec * sr))
+    min_len = int(round(min_chunk_sec * sr))
+    search_sec = float(search_silence_sec)
+
+    chunks: List[Tuple[int, int]] = []
+    start = 0
+    while start < n:
+        raw_end = min(n, start + chunk_len)
+        # find better boundary near raw_end
+        cut = _find_cut_near(raw_end, sr, env, frame_len, hop_len, search_sec, thr)
+        end = min(n, max(start + min_len, cut))
+        if end <= start:
+            end = min(n, start + chunk_len)  # fallback
+        chunks.append((start, end))
+        if end >= n:
+            break
+        # next start with overlap
+        start = max(0, end - overlap)
+
+    return chunks
+
+
+
+def slice_with_silero_vad(
+    audio_path: Path,
+    sr: int,
+    audio: np.ndarray,
+    target_speech_sec: float = 22.0,
+    max_overshoot_sec: float = 0.0,
+    max_silence_within_sec: float = 1.2,
+    min_bin_speech_sec: float = 0.0,
+    silero_threshold: float = 0.5,
+    silero_min_speech_ms: int = 150,
+    silero_min_silence_ms: int = 300,
+    silero_speech_pad_ms: int = 50,
+    use_cuda: bool = False,
+    # splitting long speech segments
+    cut_search_sec: float = 2.0,
+    min_gap_sec: float = 0.3,
+    frame_ms: float = 20.0,
+    silence_abs: float = 0.0,
+    silence_peak_ratio: float = 0.002,
+) -> List[Tuple[int, int]]:
+    """Compute chunks via Silero VAD, then pack into ~22s speech bins, strict <= target.
+    Splits long speech regions at internal pauses >= min_gap_sec using energy if needed.
+    """
+    # Use VADProcessor for Silero VAD
+    vad_processor = VADProcessor(
+        threshold=silero_threshold,
+        min_speech_ms=silero_min_speech_ms,
+        min_silence_ms=silero_min_silence_ms,
+        speech_pad_ms=silero_speech_pad_ms,
+        use_cuda=use_cuda
+    )
+    segs = vad_processor.process(audio, sr)
+
+    # ensure segments > target_speech_sec are split at internal pauses
+    frame_len = max(1, int(round(sr * frame_ms / 1000.0)))
+    hop_len = max(1, frame_len // 2)
+    env = _compute_energy_envelope(audio, frame_len, hop_len)
+    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+    thr = max(1e-7, float(silence_abs) if silence_abs > 0 else peak * float(silence_peak_ratio))
+
+    def find_silence_cut_near(target_s: float) -> float:
+        target_samp = int(round(target_s * sr))
+        if target_samp <= 0:
+            return 0.0
+        target_frame = max(0, min(len(env) - 1, target_samp // hop_len))
+        radius = max(1, int(round(cut_search_sec * sr / hop_len)))
+        lo = max(0, target_frame - radius)
+        hi = min(len(env) - 1, target_frame + radius)
+        if hi <= lo:
+            return target_s
+        silent = env[lo:hi + 1] <= thr
+        need = max(1, int(round(min_gap_sec * sr / hop_len)))
+        best_center = None
+        run_len = 0
+        start_idx = 0
+        for i, v in enumerate(silent):
+            if v:
+                if run_len == 0:
+                    start_idx = i
+                run_len += 1
+            if (not v) or i == len(silent) - 1:
+                if v and i == len(silent) - 1:
+                    pass
+                if run_len >= need:
+                    center = start_idx + run_len // 2
+                    best_center = center
+                    break
+                run_len = 0
+        if best_center is not None:
+            cut_frame = lo + best_center
+            return (cut_frame * hop_len) / sr
+        cut = _find_cut_near(target_samp, sr, env, frame_len, hop_len, cut_search_sec, thr)
+        return cut / sr
+
+    refined: list[tuple[float, float]] = []
+    for s, e in segs:
+        if e - s <= target_speech_sec:
+            refined.append((s, e))
+            continue
+        cur = s
+        while (e - cur) > target_speech_sec:
+            desired = cur + target_speech_sec
+            cut_t = find_silence_cut_near(desired)
+            if cut_t <= cur + 0.1:
+                cut_t = cur + target_speech_sec
+            refined.append((cur, min(cut_t, e)))
+            cur = cut_t
+        if cur < e:
+            refined.append((cur, e))
+    segs = refined
+
+    # Pack segments into bins without splitting words
+    bins = []
+    current_bin = []
+    current_duration = 0.0
+    for seg in segs:
+        seg_duration = seg[1] - seg[0]
+        if current_duration + seg_duration <= target_speech_sec + max_overshoot_sec:
+            current_bin.append(seg)
+            current_duration += seg_duration
+        else:
+            if current_bin:
+                start = current_bin[0][0]
+                end = current_bin[-1][1]
+                bins.append((start, end))
+            current_bin = [seg]
+            current_duration = seg_duration
+    if current_bin:
+        start = current_bin[0][0]
+        end = current_bin[-1][1]
+        bins.append((start, end))
+    out: list[tuple[int, int]] = []
+    for s, e in bins:
+        ss = max(0, int(round(s * sr)))
+        ee = max(ss + 1, int(round(e * sr)))
+        out.append((ss, ee))
+    return out
+
+
+# ------------------------- Silero VAD chunking -------------------------
+
+def _silero_vad_segments(
+    audio: np.ndarray,
+    sr: int,
+    threshold: float = 0.5,
+    min_speech_ms: int = 150,
+    min_silence_ms: int = 300,
+    speech_pad_ms: int = 50,
+    max_speech_sec: float | None = None,
+    device: str | None = None,
+) -> list[tuple[float, float]]:
+    """Use Silero VAD via torch.hub to return speech segments in seconds.
+
+    Works fully on CPU; CUDA is optional.
+    """
+    if not _HAVE_TORCH:
+        raise RuntimeError("PyTorch not available for Silero VAD")
+
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if sr != 16000:
+        # Silero expects 16k; but our pipeline preconverts to 16k mono. Just warn.
+        pass
+
+    import torch
+    try:
+        model, utils = torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True)
+        get_speech_timestamps, _, read_audio, _, collect_chunks = utils
+    except Exception as e:
+        raise RuntimeError(f"Failed to load Silero VAD from torch.hub: {e}")
+
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    try:
+        model = model.to(device)
+    except Exception:
+        pass
+
+    wav_t = torch.from_numpy(audio.astype(np.float32, copy=False))
+    if device == 'cuda':
+        wav_t = wav_t.to(device)
+
+    kwargs = dict(
+        sampling_rate=sr,
+        threshold=float(threshold),
+        min_speech_duration_ms=int(min_speech_ms),
+        min_silence_duration_ms=int(min_silence_ms),
+        speech_pad_ms=int(speech_pad_ms),
+        return_seconds=True,
+    )
+    if max_speech_sec is not None and max_speech_sec > 0:
+        kwargs['max_speech_duration_s'] = float(max_speech_sec)
+
+    try:
+        ts = get_speech_timestamps(wav_t, model, **kwargs)
+    except Exception as e:
+        raise RuntimeError(f"Silero VAD inference failed: {e}")
+
+    out: list[tuple[float, float]] = []
+    for seg in ts:
+        st = float(seg.get('start', 0.0))
+        en = float(seg.get('end', 0.0))
+        if en > st:
+            out.append((st, en))
+    return out
+
+
+def _write_wav(tmpdir: Path, stem: str, audio: np.ndarray, sr: int, idx: int) -> Path:
+    p = tmpdir / f"{stem}_chunk_{idx:05d}.wav"
+    sf.write(str(p), audio, sr)
+    return p
+
+
+def _dedup_suffix_prefix(prev_tail: str, new_text: str, min_overlap: int = 16) -> str:
+    """
+    Remove repeated prefix of new_text if it duplicates suffix of prev_tail.
+    Case-insensitive, whitespace-normalized simple check.
+    """
+    a = " ".join(prev_tail.split()).lower()
+    b = " ".join(new_text.split()).lower()
+    max_k = min(len(a), len(b), 200)  # limit
+    for k in range(max_k, min_overlap - 1, -1):
+        if a.endswith(b[:k]):
+            return new_text[k:]
+    return new_text
+
+
+# ------------------------- Main transcribe loop -------------------------
+
+def transcribe_file_sequential(model, path: Path, repo_root: Path,
+                               lang: Optional[str],
+                               chunk_sec: float, overlap_sec: float,
+                               search_silence_sec: float,
+                               silence_abs: float, silence_peak_ratio: float,
+                               frame_ms: float,
+                               dedup_tail_chars: int, min_dedup_overlap: int,
+                               debug: bool,
+                               use_vad_silero: bool = False,
+                               target_speech_sec: float = 22.0,
+                               vad_max_overshoot: float = 1.0,
+                               vad_max_silence_within: float = 1.2,
+                               vad_min_bin_speech: float = 10.0,
+                               vad_cut_search_sec: float = 2.0,
+                               vad_min_gap_sec: float = 0.3,
+                               silero_threshold: float = 0.5,
+                               silero_min_speech_ms: int = 150,
+                               silero_min_silence_ms: int = 300,
+                               silero_speech_pad_ms: int = 50,
+                               silero_cuda: bool = False,
+                               ) -> tuple[str, list[dict], list[str]]:
+    """
+    Returns (full_text, segments). segments is list of dicts with start,end,text.
+    """
+    src = _preconvert_if_needed(path, repo_root, force=False)
+    audio, sr = sf.read(str(src))
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    n = len(audio)
+    if n == 0:
+        return "", []
+
+    # Prefer VAD-based chunking when requested
+    chunks = None
+    if use_vad_silero:
+        try:
+            chunks = slice_with_silero_vad(
+                src,
+                sr,
+                audio,
+                target_speech_sec=float(target_speech_sec),
+                max_overshoot_sec=float(vad_max_overshoot),
+                max_silence_within_sec=float(vad_max_silence_within),
+                min_bin_speech_sec=float(vad_min_bin_speech),
+                silero_threshold=float(silero_threshold),
+                silero_min_speech_ms=int(silero_min_speech_ms),
+                silero_min_silence_ms=int(silero_min_silence_ms),
+                silero_speech_pad_ms=int(silero_speech_pad_ms),
+                use_cuda=bool(silero_cuda),
+                cut_search_sec=float(vad_cut_search_sec),
+                min_gap_sec=float(vad_min_gap_sec),
+                frame_ms=float(frame_ms),
+                silence_abs=float(silence_abs),
+                silence_peak_ratio=float(silence_peak_ratio),
+            )
+        except Exception as e:
+            print(f"[VAD][Silero] failed ({e}); falling back to energy-based slicing.")
+
+    if chunks is None:
+        # If VAD was requested but failed, honor target_speech_sec as time target
+        time_target = float(target_speech_sec) if use_vad_silero else float(chunk_sec)
+        chunks = slice_into_chunks(audio, sr, time_target, overlap_sec,
+                                   search_silence_sec, silence_abs, silence_peak_ratio,
+                                   frame_ms)
+    if debug:
+        print(f"[CHUNKS] {path.name}: {len(chunks)} chunks; sr={sr}; "
+              f"chunkв‰€{chunk_sec}s ovlp={overlap_sec}s search={search_silence_sec}s "
+              f"thr(abs={silence_abs}, peak_ratio={silence_peak_ratio})")
+
+    tmpdir = Path(tempfile.gettempdir()) / "gigaam_chunks_seq"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    full_text_parts: List[str] = []
+    segments: List[dict] = []
+
+    for i, (s0, s1) in enumerate(chunks):
+        seg_audio = audio[s0:s1]
+        wav_path = _write_wav(tmpdir, path.stem, seg_audio, sr, i)
+        try:
+            with torch.inference_mode():
+                out = model.transcribe(str(wav_path), language=lang) if lang else model.transcribe(str(wav_path))
+        except TypeError:
+            with torch.inference_mode():
+                out = model.transcribe(str(wav_path))
+
+        # extract text
+        if isinstance(out, dict):
+            text = out.get("transcription") or out.get("text") or out.get("transcript") or ""
+        elif isinstance(out, list):
+            # join list of strings/dicts
+            parts = []
+            for item in out:
+                if isinstance(item, dict):
+                    parts.append(str(item.get("transcription") or item.get("text") or item.get("transcript") or ""))
+                else:
+                    parts.append(str(item))
+            text = " ".join([t for t in parts if t]).strip()
+        else:
+            text = out if isinstance(out, str) else str(out)
+
+        if debug:
+            print(f"[CHUNK {i+1:03d}/{len(chunks)}] {path.name} "
+                  f"{_format_ts(s0/sr)}вЂ“{_format_ts(s1/sr)} txt_len={len(text)}")
+
+        # deduplicate overlap
+        tail = "".join(full_text_parts)[-dedup_tail_chars:] if full_text_parts else ""
+        text = _dedup_suffix_prefix(tail, text, min_overlap=min_dedup_overlap)
+        if text:
+            full_text_parts.append(text)
+            segments.append({
+                "start": s0 / sr,
+                "end": s1 / sr,
+                "text": text,
+            })
+
+        try:
+            wav_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        # free VRAM between chunks
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    full_text = " ".join([t for t in full_text_parts if t]).strip()
+    
+    # Save segments in vad_hand_results_6m.txt format for comparison
+    comparison_lines = []
+    for seg in segments:
+        start = seg["start"]
+        end = seg["end"]
+        # Determine segment type (Voice/Noise) based on text content
+        seg_type = "Голос" if seg["text"].strip() else "Шум"
+        comparison_lines.append(f"{start:.1f}-{end:.1f} {seg_type}")
+    
+    return full_text, segments, comparison_lines
+
+
+# ------------------------- CLI -------------------------
+
+
+
+# ------------------------- CLI -------------------------
+
+import shutil  # after functions to avoid linter noise
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", type=str, help="Path to audio file/dir or JSONL/JSON manifest")
+    parser.add_argument("output", type=str, help="Path to output JSON file")
+    parser.add_argument("--model", default="v2_rnnt", help="Model type: v2_rnnt, v2_ctc, rnnt, ctc, etc.")
+    parser.add_argument("--lang", type=str, default="", help="Force language code, e.g. 'ru' or 'en'. Empty=auto")
+    parser.add_argument("--output_format", choices=["json", "txt"], default="json",
+                        help="Output format: json (default) or txt")
+    parser.add_argument("--output_report", type=str, default="transcript_results.txt",
+                        help="Path for text report when using --output_format txt")
+
+    # chunking params
+    parser.add_argument("--chunk_sec", type=float, default=22.0, help="Target chunk length (seconds)")
+    parser.add_argument("--overlap_sec", type=float, default=1.0, help="Overlap between chunks (seconds)")
+    parser.add_argument("--search_silence_sec", type=float, default=0.6, help="Search window near boundary to cut at silence (seconds)")
+    parser.add_argument("--frame_ms", type=float, default=20.0, help="Frame size for energy envelope (ms)")
+    parser.add_argument("--silence_threshold", type=float, default=0.0, help="Absolute RMS threshold; 0=use peak ratio")
+    parser.add_argument("--silence_peak_ratio", type=float, default=0.002, help="Threshold = global_peak * ratio when absolute=0")
+
+    # VAD options
+    parser.add_argument("--target_speech_sec", type=float, default=22.0, help="Target speech seconds per bin (no word cuts)")
+    parser.add_argument("--vad_max_overshoot", type=float, default=1.0, help="Allowable overshoot beyond target speech per bin (sec)")
+    parser.add_argument("--vad_max_silence_within", type=float, default=1.2, help="Max silence gap allowed inside a bin (sec)")
+    parser.add_argument("--vad_min_bin_speech", type=float, default=10.0, help="Min speech per bin before early close (sec)")
+    parser.add_argument("--vad_min_gap_sec", type=float, default=0.3, help="Minimum internal pause to split long speech (sec)")
+    parser.add_argument("--vad_cut_search_sec", type=float, default=2.0, help="Search window around target for internal pause cut (sec)")
+
+    # Silero VAD options (Windows-friendly, no Triton)
+    parser.add_argument("--vad_silero", action="store_true", help="Use Silero VAD (torch.hub) for chunking into ~22s speech bins")
+    parser.add_argument("--silero_threshold", type=float, default=0.5, help="Silero VAD threshold")
+    parser.add_argument("--silero_min_speech_ms", type=int, default=150, help="Minimum speech duration in ms")
+    parser.add_argument("--silero_min_silence_ms", type=int, default=300, help="Minimum silence to separate speech in ms")
+    parser.add_argument("--silero_speech_pad_ms", type=int, default=50, help="Padding around detected speech in ms")
+    parser.add_argument("--silero_cuda", action="store_true", help="Run Silero VAD on CUDA if available")
+
+    # dedup params
+    parser.add_argument("--dedup_tail_chars", type=int, default=80, help="How many trailing chars from previous text to compare")
+    parser.add_argument("--min_dedup_overlap", type=int, default=16, help="Min overlap to consider as duplication")
+
+    # batching / misc
+    parser.add_argument("--batch_size", type=int, default=16, help="Files per loop batch (I/O grouping)")
+    parser.add_argument("--sample", type=int, default=0, help="Sample N files from manifest (0=all)")
+    parser.add_argument("--write_segments", type=str, default="", help="Optional JSONL file to write segments with timestamps")
+    parser.add_argument("--write_segments_punct", type=str, default="", help="Optional JSONL to write segments with punctuation (text_punct)")
+    parser.add_argument("--punct_ru", action="store_true", help="Apply RUPunct to segment texts and write text_punct")
+    parser.add_argument("--no_lock", action="store_true", help="Do not acquire GPU lock")
+    parser.add_argument("--debug", action="store_true", help="Debug prints")
+    args = parser.parse_args()
+
+    repo_root = configure_local_caches()
+    require_cuda()
+
+    if gigaam is None:
+        raise SystemExit(
+            "GigaAM is not installed.\n"
+            "Use Python 3.11/3.12 venv and then: pip install gigaam  (or git+https://github.com/salute-developers/GigaAM).\n"
+            f"Underlying import error: {_IMPORT_ERR}"
+        )
+
+    # GPU lock
+    lock_path = repo_root / ".tmp" / "gpu.lock"
+    pid = os.getpid()
+    lock_acquired = False
+    if not args.no_lock:
+        lock_acquired, pid = acquire_gpu_lock(lock_path)
+        if not lock_acquired:
+            raise RuntimeError(f"Could not acquire GPU lock at {lock_path}; another process is running")
+
+    # Load model
+    model = gigaam.load_model(args.model)
+    if hasattr(model, "eval"):
+        model.eval()
+    try:
+        if hasattr(model, "to"):
+            model = model.to("cuda")
+        elif hasattr(model, "cuda"):
+            model = model.cuda()
+    except Exception:
+        pass
+
+    # Collect input files
+    input_path = Path(args.input)
+    if input_path.suffix.lower() in {".jsonl", ".json"} and input_path.is_file():
+        audio_files: list[Path] = []
+        if input_path.suffix.lower() == ".jsonl":
+            with open(input_path, "r", encoding="utf-8-sig") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    p = obj.get("audio_filepath") or obj.get("audio")
+                    if p:
+                        pp = Path(p)
+                        if not pp.is_absolute():
+                            pp = (input_path.parent / pp).resolve()
+                        audio_files.append(pp)
+        else:
+            with open(input_path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            if isinstance(obj, dict):
+                audio_files = [Path(k) for k in obj.keys()]
+            elif isinstance(obj, list):
+                for it in obj:
+                    if isinstance(it, dict):
+                        p = it.get("audio_filepath") or it.get("audio")
+                        if p:
+                            pp = Path(p)
+                            if not pp.is_absolute():
+                                pp = (input_path.parent / pp).resolve()
+                            audio_files.append(pp)
+    else:
+        audio_files = [input_path] if input_path.is_file() else sorted(
+            p for p in input_path.glob("**/*") if p.suffix.lower() in {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus"}
+        )
+
+    # Optional sampling
+    if args.sample and args.sample > 0 and len(audio_files) > args.sample:
+        import random
+        random.seed(42)
+        random.shuffle(audio_files)
+        audio_files = audio_files[: args.sample]
+
+    # Transcribe
+    results: dict[str, str] = {}
+    seg_writer = None
+    seg_writer_punct = None
+    rupunct = None
+    if args.write_segments:
+        Path(args.write_segments).parent.mkdir(parents=True, exist_ok=True)
+        seg_writer = open(args.write_segments, "w", encoding="utf-8")
+    if args.write_segments_punct:
+        Path(args.write_segments_punct).parent.mkdir(parents=True, exist_ok=True)
+        seg_writer_punct = open(args.write_segments_punct, "w", encoding="utf-8")
+    if args.punct_ru and (args.write_segments_punct or args.write_segments):
+        try:
+            rupunct = _build_rupunct_pipeline()
+            print("[RUPunct] model loaded for inline punctuation")
+        except Exception as e:
+            print(f"[RUPunct][WARN] cannot load model: {e}")
+            rupunct = None
+
+    bs = max(1, int(args.batch_size))
+    try:
+        for i in range(0, len(audio_files), bs):
+            batch_paths = audio_files[i: i + bs]
+            print(f"Transcribing batch {i // bs + 1} [{len(batch_paths)} files] ...")
+            for p in batch_paths:
+                full_text, segments, comparison_lines = transcribe_file_sequential(
+                    model, p, repo_root,
+                    args.lang or None,
+                    args.chunk_sec, args.overlap_sec,
+                    args.search_silence_sec,
+                    float(args.silence_threshold), float(args.silence_peak_ratio),
+                    float(args.frame_ms),
+                    int(args.dedup_tail_chars), int(args.min_dedup_overlap),
+                    bool(args.debug),
+                    bool(args.vad_silero),
+                    float(args.target_speech_sec),
+                    float(args.vad_max_overshoot),
+                    float(args.vad_max_silence_within),
+                    float(args.vad_min_bin_speech),
+                    float(args.vad_cut_search_sec),
+                    float(args.vad_min_gap_sec),
+                    float(args.silero_threshold),
+                    int(args.silero_min_speech_ms),
+                    int(args.silero_min_silence_ms),
+                    int(args.silero_speech_pad_ms),
+                    bool(args.silero_cuda),
+                )
+                results[str(p)] = full_text
+                if (seg_writer or seg_writer_punct) and segments:
+                    for s in segments:
+                        base_obj = {
+                            "audio": str(p),
+                            "start": s["start"],
+                            "end": s["end"],
+                            "start_str": _format_ts(s["start"]),
+                            "end_str": _format_ts(s["end"]),
+                            "text": s["text"],
+                        }
+                        if seg_writer:
+                            seg_writer.write(json.dumps(base_obj, ensure_ascii=False) + "\n")
+                        if seg_writer_punct:
+                            obj = dict(base_obj)
+                            if rupunct is not None:
+                                try:
+                                    obj["text_punct"] = _rupunct_text(rupunct, s["text"]) or s["text"]
+                                except Exception:
+                                    obj["text_punct"] = s["text"]
+                            else:
+                                obj["text_punct"] = s["text"]
+                            seg_writer_punct.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+            vram_report(f"batch_{i // bs + 1}")
+            gc.collect()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save main JSON output
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+            
+        # Save text report if requested
+        if args.output_format == "txt":
+            report_path = Path(args.output_report)
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            with report_path.open("w", encoding="utf-8") as f:
+                for line in comparison_lines:
+                    f.write(f"{line}\n")
+    finally:
+        if seg_writer:
+            seg_writer.close()
+        if seg_writer_punct:
+            seg_writer_punct.close()
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        gc.collect()
+        vram_report("final")
+        # release lock
+        if not args.no_lock:
+            release_gpu_lock(lock_path, pid)
+
+
+if __name__ == "__main__":
+    main()
