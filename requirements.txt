@@ -1,0 +1,6 @@
+torch
+numpy
+soundfile
+pytest
+transformers  # optional
+gigaam  # optional
