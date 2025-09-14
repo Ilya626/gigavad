@@ -31,7 +31,7 @@ import shutil
 import io
 from pathlib import Path
 from typing import List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import soundfile as sf
@@ -286,55 +286,67 @@ def _preconvert_if_needed(path: Path, repo_root: Path, force: bool = False) -> P
 # ------------------------- Chunking logic (no VAD deps) -------------------------
 
 @dataclass
-class VadConfig:
-    target_speech_sec: float = 22.0
-    max_overshoot_sec: float = 0.0
-    max_silence_within_sec: float = 1.2
-    min_bin_speech_sec: float = 0.0
-    silero_threshold: float = 0.65
-    silero_min_speech_ms: int = 200
-    silero_min_silence_ms: int = 250
-    silero_speech_pad_ms: int = 35
-    pad_context_ms: int = 0
+@dataclass
+class SileroParams:
+    threshold: float = 0.65
+    min_speech_ms: int = 200
+    min_silence_ms: int = 250
+    speech_pad_ms: int = 35
     use_cuda: bool = False
+    model_dir: Optional[str] = None
+
+
+@dataclass
+class ChunkingParams:
+    target_speech_sec: float = 22.0
     cut_search_sec: float = 2.0
-    min_gap_sec: float = 0.3
     frame_ms: float = 20.0
     silence_abs: float = 0.0
     silence_peak_ratio: float = 0.002
     adaptive: bool = True
-    silero_model_dir: Optional[str] = None
+    pad_context_ms: int = 0
+    min_gap_sec: float = 0.3
     merge_close_segs: bool = False
 
 
-def slice_with_silero_vad(sr: int, audio: np.ndarray, cfg: VadConfig) -> List[Tuple[int, int]]:
-    """Compute chunks via Silero VAD and pack them into ≈22 s speech bins."""
-    # Use VADProcessor for Silero VAD
-    vad_processor = VADProcessor(
-        threshold=cfg.silero_threshold,
-        min_speech_ms=cfg.silero_min_speech_ms,
-        min_silence_ms=cfg.silero_min_silence_ms,
-        speech_pad_ms=cfg.silero_speech_pad_ms,
-        max_speech_duration_s=cfg.target_speech_sec,
-        use_cuda=cfg.use_cuda,
-        model_dir=cfg.silero_model_dir,
-    )
+@dataclass
+class PackingParams:
+    max_overshoot_sec: float = 0.0
+    max_silence_within_sec: float = 1.2
+    min_bin_speech_sec: float = 0.0
+
+
+@dataclass
+class VadConfig:
+    silero: SileroParams = field(default_factory=SileroParams)
+    chunk: ChunkingParams = field(default_factory=ChunkingParams)
+    pack: PackingParams = field(default_factory=PackingParams)
+
+
+def slice_with_silero_vad(
+    sr: int,
+    audio: np.ndarray,
+    vad_processor: VADProcessor,
+    chunk_cfg: ChunkingParams,
+    pack_cfg: PackingParams,
+) -> tuple[list[tuple[int, int]], list[tuple[float, float]]]:
+    """Compute chunks via Silero VAD and pack them into ≈target_speech_sec bins."""
+
     segs = vad_processor.process(audio, sr)
 
-    # ensure segments > target_speech_sec are split using ChunkingProcessor
     cp_split = ChunkingProcessor(
-        chunk_sec=cfg.target_speech_sec,
+        chunk_sec=chunk_cfg.target_speech_sec,
         overlap_sec=0.0,
-        search_silence_sec=cfg.cut_search_sec,
-        silence_abs=cfg.silence_abs,
-        silence_peak_ratio=cfg.silence_peak_ratio,
-        frame_ms=cfg.frame_ms,
-        adaptive=cfg.adaptive,
+        search_silence_sec=chunk_cfg.cut_search_sec,
+        silence_abs=chunk_cfg.silence_abs,
+        silence_peak_ratio=chunk_cfg.silence_peak_ratio,
+        frame_ms=chunk_cfg.frame_ms,
+        adaptive=chunk_cfg.adaptive,
     )
 
     refined: list[tuple[float, float]] = []
     for s, e in segs:
-        if e - s <= cfg.target_speech_sec:
+        if e - s <= chunk_cfg.target_speech_sec:
             refined.append((s, e))
             continue
         seg_audio = audio[int(round(s * sr)): int(round(e * sr))]
@@ -345,9 +357,8 @@ def slice_with_silero_vad(sr: int, audio: np.ndarray, cfg: VadConfig) -> List[Tu
             refined.append((start_t, min(end_t, e)))
     segs = refined
 
-    # expand each segment for boundary safety
-    if cfg.pad_context_ms > 0:
-        pad = cfg.pad_context_ms / 1000.0
+    if chunk_cfg.pad_context_ms > 0:
+        pad = chunk_cfg.pad_context_ms / 1000.0
         total_dur = len(audio) / sr
         padded: list[tuple[float, float]] = []
         for s, e in segs:
@@ -356,17 +367,16 @@ def slice_with_silero_vad(sr: int, audio: np.ndarray, cfg: VadConfig) -> List[Tu
             padded.append((s, e))
         segs = padded
 
-    if cfg.merge_close_segs and segs:
+    if chunk_cfg.merge_close_segs and segs:
         merged: list[tuple[float, float]] = [segs[0]]
         for s, e in segs[1:]:
             ps, pe = merged[-1]
-            if s - pe < cfg.min_gap_sec:
+            if s - pe < chunk_cfg.min_gap_sec:
                 merged[-1] = (ps, e)
             else:
                 merged.append((s, e))
         segs = merged
 
-    # Pack segments into bins considering gaps and max duration
     bins: list[list[tuple[float, float]]] = []
     cur_bin: list[tuple[float, float]] = []
     cur_speech = 0.0
@@ -375,26 +385,25 @@ def slice_with_silero_vad(sr: int, audio: np.ndarray, cfg: VadConfig) -> List[Tu
         seg_duration = e - s
         if cur_bin:
             gap = s - (last_end if last_end is not None else s)
-            if gap > cfg.max_silence_within_sec or (
-                (cur_speech + seg_duration) > (cfg.target_speech_sec + cfg.max_overshoot_sec)
+            if gap > pack_cfg.max_silence_within_sec or (
+                (cur_speech + seg_duration) > (chunk_cfg.target_speech_sec + pack_cfg.max_overshoot_sec)
             ):
-                if cur_speech >= cfg.min_bin_speech_sec:
-                    bins.append(cur_bin)
-                    cur_bin = []
-                    cur_speech = 0.0
-                # else: keep accumulating despite gap/overshoot until threshold
+                bins.append(cur_bin)
+                cur_bin = []
+                cur_speech = 0.0
         cur_bin.append((s, e))
         cur_speech += seg_duration
         last_end = e
     if cur_bin:
         bins.append(cur_bin)
 
-    if cfg.min_bin_speech_sec > 0:
-        for b in bins[:-1]:  # last bin may be shorter
+    if pack_cfg.min_bin_speech_sec > 0:
+        for b in bins[:-1]:
             speech = sum(e - s for s, e in b)
-            assert speech >= cfg.min_bin_speech_sec, (
-                f"Bin speech {speech:.2f}s shorter than {cfg.min_bin_speech_sec}s"
-            )
+            if speech < pack_cfg.min_bin_speech_sec:
+                raise ValueError(
+                    f"Bin speech {speech:.2f}s shorter than {pack_cfg.min_bin_speech_sec}s"
+                )
 
     out: list[tuple[int, int]] = []
     for bin_segs in bins:
@@ -483,32 +492,43 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
     speech_secs: list[tuple[float, float]] | None = None
     if use_vad_silero:
         try:
+            vad_processor = VADProcessor(
+                threshold=vad_cfg.silero.threshold,
+                min_speech_ms=vad_cfg.silero.min_speech_ms,
+                min_silence_ms=vad_cfg.silero.min_silence_ms,
+                speech_pad_ms=vad_cfg.silero.speech_pad_ms,
+                max_speech_duration_s=vad_cfg.chunk.target_speech_sec,
+                use_cuda=vad_cfg.silero.use_cuda,
+                model_dir=vad_cfg.silero.model_dir,
+            )
             chunks, speech_secs = slice_with_silero_vad(
                 sr,
                 audio,
-                vad_cfg,
+                vad_processor,
+                vad_cfg.chunk,
+                vad_cfg.pack,
             )
         except Exception as e:
             print(f"[VAD][Silero] failed ({e}); falling back to energy-based slicing.")
 
     if chunks is None:
         # If VAD was requested but failed, honor target_speech_sec as time target
-        time_target = float(vad_cfg.target_speech_sec) if use_vad_silero else float(chunk_sec)
+        time_target = float(vad_cfg.chunk.target_speech_sec) if use_vad_silero else float(chunk_sec)
         cp = ChunkingProcessor(
             chunk_sec=time_target,
             overlap_sec=overlap_sec,
             search_silence_sec=search_silence_sec,
-            silence_abs=vad_cfg.silence_abs,
-            silence_peak_ratio=vad_cfg.silence_peak_ratio,
-            frame_ms=vad_cfg.frame_ms,
-            adaptive=vad_cfg.adaptive,
+            silence_abs=vad_cfg.chunk.silence_abs,
+            silence_peak_ratio=vad_cfg.chunk.silence_peak_ratio,
+            frame_ms=vad_cfg.chunk.frame_ms,
+            adaptive=vad_cfg.chunk.adaptive,
         )
         chunks = cp.process(audio, sr)
     if debug:
         print(
             f"[CHUNKS] {path.name}: {len(chunks)} chunks; sr={sr}; "
             f"chunk≈{time_target}s ovlp={overlap_sec}s search={search_silence_sec}s "
-            f"thr(abs={vad_cfg.silence_abs}, peak_ratio={vad_cfg.silence_peak_ratio})"
+            f"thr(abs={vad_cfg.chunk.silence_abs}, peak_ratio={vad_cfg.chunk.silence_peak_ratio})"
         )
 
     tmpdir = None
@@ -778,24 +798,30 @@ def main():
             rupunct = None
 
     vad_cfg = VadConfig(
-        target_speech_sec=float(args.target_speech_sec),
-        max_overshoot_sec=float(args.vad_max_overshoot),
-        max_silence_within_sec=float(args.vad_max_silence_within),
-        min_bin_speech_sec=float(args.vad_min_bin_speech),
-        cut_search_sec=float(args.vad_cut_search_sec),
-        min_gap_sec=float(args.vad_min_gap_sec),
-        merge_close_segs=bool(args.vad_merge_segs),
-        silero_threshold=float(args.silero_threshold),
-        silero_min_speech_ms=int(args.silero_min_speech_ms),
-        silero_min_silence_ms=int(args.silero_min_silence_ms),
-        silero_speech_pad_ms=int(args.silero_speech_pad_ms),
-        pad_context_ms=int(args.vad_pad_ms),
-        use_cuda=bool(args.silero_cuda),
-        silero_model_dir=args.silero_model_dir or None,
-        frame_ms=float(args.frame_ms),
-        silence_abs=float(args.silence_threshold),
-        silence_peak_ratio=float(args.silence_peak_ratio),
-        adaptive=not args.no_adaptive,
+        silero=SileroParams(
+            threshold=float(args.silero_threshold),
+            min_speech_ms=int(args.silero_min_speech_ms),
+            min_silence_ms=int(args.silero_min_silence_ms),
+            speech_pad_ms=int(args.silero_speech_pad_ms),
+            use_cuda=bool(args.silero_cuda),
+            model_dir=args.silero_model_dir or None,
+        ),
+        chunk=ChunkingParams(
+            target_speech_sec=float(args.target_speech_sec),
+            cut_search_sec=float(args.vad_cut_search_sec),
+            frame_ms=float(args.frame_ms),
+            silence_abs=float(args.silence_threshold),
+            silence_peak_ratio=float(args.silence_peak_ratio),
+            adaptive=not args.no_adaptive,
+            pad_context_ms=int(args.vad_pad_ms),
+            min_gap_sec=float(args.vad_min_gap_sec),
+            merge_close_segs=bool(args.vad_merge_segs),
+        ),
+        pack=PackingParams(
+            max_overshoot_sec=float(args.vad_max_overshoot),
+            max_silence_within_sec=float(args.vad_max_silence_within),
+            min_bin_speech_sec=float(args.vad_min_bin_speech),
+        ),
     )
 
     bs = max(1, int(args.batch_size))

@@ -1,5 +1,6 @@
 import numpy as np
 import sys
+import pytest
 from pathlib import Path
 import types
 
@@ -14,25 +15,24 @@ import inference_gigaam
 
 
 class DummyVADProcessor:
-    def __init__(self, *args, **kwargs):
-        pass
-
     def process(self, audio, sr):
         return [(0.0, 1.0), (3.0, 4.0), (10.0, 11.0)]
 
 
-def test_min_bin_speech_accumulates(monkeypatch):
+def test_min_bin_speech_enforced(monkeypatch):
     monkeypatch.setattr(inference_gigaam, "VADProcessor", DummyVADProcessor)
     sr = 1000
     audio = np.zeros(sr * 12, dtype=np.float32)
     cfg = inference_gigaam.VadConfig(
-        target_speech_sec=2.0,
-        max_silence_within_sec=1.2,
-        min_bin_speech_sec=3.0,
+        chunk=inference_gigaam.ChunkingParams(target_speech_sec=2.0),
+        pack=inference_gigaam.PackingParams(
+            max_silence_within_sec=1.2,
+            min_bin_speech_sec=3.0,
+        ),
     )
-    chunks, _ = inference_gigaam.slice_with_silero_vad(sr, audio, cfg)
-    assert len(chunks) == 1
-    assert chunks[0] == (0, 11000)
+    vad = DummyVADProcessor()
+    with pytest.raises(ValueError):
+        inference_gigaam.slice_with_silero_vad(sr, audio, vad, cfg.chunk, cfg.pack)
 
 
 def test_merge_close_segments(monkeypatch):
@@ -40,8 +40,11 @@ def test_merge_close_segments(monkeypatch):
     sr = 1000
     audio = np.zeros(sr * 12, dtype=np.float32)
     cfg = inference_gigaam.VadConfig(
-        merge_close_segs=True,
-        min_gap_sec=2.5,
+        chunk=inference_gigaam.ChunkingParams(
+            merge_close_segs=True,
+            min_gap_sec=2.5,
+        )
     )
-    _, segs = inference_gigaam.slice_with_silero_vad(sr, audio, cfg)
+    vad = DummyVADProcessor()
+    _, segs = inference_gigaam.slice_with_silero_vad(sr, audio, vad, cfg.chunk, cfg.pack)
     assert segs == [(0.0, 4.0), (10.0, 11.0)]
