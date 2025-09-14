@@ -1,9 +1,13 @@
+"""Voice Activity Detection utilities wrapping Silero VAD."""
+
 import numpy as np
 from typing import List, Tuple
 import torch
 
 
 class VADProcessor:
+    """Detect speech segments in audio using the Silero VAD model."""
+
     def __init__(
         self,
         threshold: float = 0.65,
@@ -22,6 +26,7 @@ class VADProcessor:
         self.model = self._load_model()
 
     def _load_model(self):
+        """Load Silero VAD from ``torch.hub`` and cache helper functions."""
         try:
             model, utils = torch.hub.load(
                 repo_or_dir='snakers4/silero-vad',
@@ -33,20 +38,22 @@ class VADProcessor:
             self.get_speech_timestamps = get_speech_timestamps
         except Exception as e:
             raise RuntimeError(f"Failed to load Silero VAD: {e}")
-        
+
         device = 'cuda' if (self.use_cuda and torch.cuda.is_available()) else 'cpu'
         return model.to(device)
 
     def process(self, audio: np.ndarray, sr: int) -> List[Tuple[float, float]]:
+        """Return ``(start, end)`` times of detected speech segments in seconds."""
         segs_raw = self._silero_vad_segments(audio, sr)
         return [(float(s["start"]), float(s["end"])) for s in segs_raw]
 
     def _silero_vad_segments(self, audio: np.ndarray, sr: int) -> List[Tuple[float, float]]:
+        """Internal helper performing VAD and returning raw segment dicts."""
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
-        
+
         wav_tensor = torch.from_numpy(audio.astype(np.float32)).to(self.model.device)
-        
+
         return self.get_speech_timestamps(
             wav_tensor,
             self.model,
