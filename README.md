@@ -11,7 +11,9 @@ Utilities for chunked speech transcription and voice activity detection.
   noise-floor statistics which can be disabled with ``adaptive=False`` or the
   ``--no_adaptive`` CLI flag.
 - **inference_gigaam.py**: command-line tool for transcribing long recordings
-  with [GigaAM](https://github.com/salute-developers/GigaAM) models.
+  with [GigaAM](https://github.com/salute-developers/GigaAM) models. CLI options
+  are grouped (Chunking, VAD, etc.) and can be loaded from a JSON config file
+  via the `--config` flag.
 - **rupunct_apply.py**: optional script that restores Russian punctuation on
   JSONL segment files.
 
@@ -28,8 +30,14 @@ pip install torch soundfile
 Transcribe a WAV file and obtain a JSON transcript:
 
 ```bash
+# direct CLI usage
 python inference_gigaam.py input.wav transcript.json \
     --model v2_rnnt --lang ru --chunk_sec 22 --overlap_sec 1.0
+
+# or place arguments in a JSON config file
+echo '{"model": "v2_rnnt", "lang": "ru", "chunk_sec": 22, "overlap_sec": 1.0}' > cfg.json
+python inference_gigaam.py input.wav transcript.json --config cfg.json
+
 # add --vad_silero --silero_model_dir /path/to/silero-vad to use local VAD
 # use --vad_pad_ms to extend VAD segments and avoid cutting words at boundaries
 ```
