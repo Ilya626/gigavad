@@ -6,6 +6,7 @@ import types
 # Provide stub modules before importing the real code
 stub_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False))
 sys.modules.setdefault("torch", stub_torch)
+sys.modules.setdefault("soundfile", types.ModuleType("soundfile"))
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
