@@ -42,6 +42,10 @@ Use `--vad_min_bin_speech` to require a minimum amount of speech in each VAD
 bin. If a gap or duration limit would close the bin early, segments are merged
 with subsequent ones until this threshold is reached.
 
+Pass `--vad_merge_segs` to merge adjacent VAD segments separated by short
+pauses. Gaps shorter than `--vad_min_gap_sec` are joined before bin packing,
+reducing excessive fragmentation of speech.
+
 To run plain VAD and save detected segments:
 
 ```bash
