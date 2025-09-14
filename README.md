@@ -7,7 +7,9 @@ Utilities for chunked speech transcription and voice activity detection.
   detecting speech segments. Supports an optional ``model_dir`` parameter to
   load pre-downloaded weights and avoid using ``torch.hub``.
 - **ChunkingProcessor**: splits long audio into manageable chunks based on
-  energy and optional overlap.
+  energy and optional overlap. Supports adaptive silence thresholds based on
+  noise-floor statistics which can be disabled with ``adaptive=False`` or the
+  ``--no_adaptive`` CLI flag.
 - **inference_gigaam.py**: command-line tool for transcribing long recordings
   with [GigaAM](https://github.com/salute-developers/GigaAM) models.
 - **rupunct_apply.py**: optional script that restores Russian punctuation on

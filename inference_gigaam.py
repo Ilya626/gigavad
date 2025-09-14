@@ -304,6 +304,7 @@ def slice_with_silero_vad(
     frame_ms: float = 20.0,
     silence_abs: float = 0.0,
     silence_peak_ratio: float = 0.002,
+    adaptive: bool = True,
     silero_model_dir: Optional[str] = None,
 ) -> List[Tuple[int, int]]:
     """Compute chunks via Silero VAD and pack them into ≈22 s speech bins.
@@ -323,6 +324,8 @@ def slice_with_silero_vad(
         Extra padding applied to each detected speech segment before bin
         packing (milliseconds). Provides additional context to reduce the risk
         of cutting words at bin boundaries.
+    adaptive:
+        Enable adaptive thresholding when splitting long segments.
     """
     # Use VADProcessor for Silero VAD
     vad_processor = VADProcessor(
@@ -344,6 +347,7 @@ def slice_with_silero_vad(
         silence_abs=silence_abs,
         silence_peak_ratio=silence_peak_ratio,
         frame_ms=frame_ms,
+        adaptive=adaptive,
     )
 
     refined: list[tuple[float, float]] = []
@@ -439,6 +443,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
                                search_silence_sec: float,
                                silence_abs: float, silence_peak_ratio: float,
                                frame_ms: float,
+                               adaptive: bool,
                                dedup_tail_chars: int, min_dedup_overlap: int,
                                debug: bool,
                                use_vad_silero: bool = False,
@@ -488,6 +493,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
                 frame_ms=float(frame_ms),
                 silence_abs=float(silence_abs),
                 silence_peak_ratio=float(silence_peak_ratio),
+                adaptive=adaptive,
                 silero_model_dir=silero_model_dir,
             )
         except Exception as e:
@@ -503,6 +509,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
             silence_abs=silence_abs,
             silence_peak_ratio=silence_peak_ratio,
             frame_ms=frame_ms,
+            adaptive=adaptive,
         )
         chunks = cp.process(audio, sr)
     if debug:
@@ -606,6 +613,7 @@ def main():
     parser.add_argument("--frame_ms", type=float, default=20.0, help="Frame size for energy envelope (ms)")
     parser.add_argument("--silence_threshold", type=float, default=0.0, help="Absolute RMS threshold; 0=use peak ratio")
     parser.add_argument("--silence_peak_ratio", type=float, default=0.002, help="Threshold = global_peak * ratio when absolute=0")
+    parser.add_argument("--no_adaptive", action="store_true", help="Disable adaptive noise-floor thresholding")
 
     # VAD options
     parser.add_argument("--target_speech_sec", type=float, default=22.0, help="Target speech seconds per bin (no word cuts)")
@@ -754,6 +762,7 @@ def main():
                     args.search_silence_sec,
                     float(args.silence_threshold), float(args.silence_peak_ratio),
                     float(args.frame_ms),
+                    not args.no_adaptive,
                     int(args.dedup_tail_chars), int(args.min_dedup_overlap),
                     bool(args.debug),
                     bool(args.vad_silero),
