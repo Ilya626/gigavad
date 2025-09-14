@@ -278,7 +278,8 @@ def _preconvert_if_needed(path: Path, repo_root: Path, force: bool = False) -> P
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return out_path
-    except Exception:
+    except Exception as e:
+        print(f"[preconvert] Conversion skipped for {path}: {e}")
         return path
 
 
