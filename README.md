@@ -21,9 +21,7 @@ Utilities for chunked speech transcription and voice activity detection.
 Create a Python 3.11/3.12 virtual environment and install dependencies:
 
 ```bash
-pip install -r requirements.txt  # if available
-# or install manually
-pip install torch soundfile
+pip install -r requirements.txt
 ```
 
 ## Quick start
@@ -57,8 +55,7 @@ reducing excessive fragmentation of speech.
 To run plain VAD and save detected segments:
 
 ```bash
-# optionally provide a directory with silero-vad model.jit and utils_vad.py
-python vad_example.py input.wav vad_output.txt [model_dir]
+python vad_example.py input.wav vad_output.txt
 ```
 
 For punctuation restoration of per-segment JSONL:
@@ -67,6 +64,51 @@ For punctuation restoration of per-segment JSONL:
 python rupunct_apply.py --in segments.jsonl --out segments_punct.jsonl \
     --merge_json transcript_punct.json
 ```
+
+## Offline Silero VAD
+
+Download `model.jit` and `utils_vad.py` from the
+[snakers4/silero-vad](https://github.com/snakers4/silero-vad) repository and
+place them in a directory. Provide this directory to run VAD without relying on
+`torch.hub`:
+
+```bash
+python vad_example.py input.wav vad_output.txt --silero_model_dir /path/to/silero-vad
+python inference_gigaam.py input.wav transcript.json \
+    --model v2_rnnt --lang ru --vad_silero \
+    --silero_model_dir /path/to/silero-vad
+```
+
+## Testing
+
+The repository includes basic unit tests and example commands. Example WAV and
+reference text files (e.g. `ilya_6m_test.wav` and `vad_hand_results_6m.txt`)
+are user-provided.
+
+1. Run automated tests:
+
+   ```bash
+   python -m pytest tests
+   ```
+
+2. Execute VAD on a sample file and compare against a reference:
+
+   ```bash
+   python vad_example.py ilya_6m_test.wav vad_output.txt --silero_model_dir /path/to/silero-vad
+   diff -y vad_output.txt vad_hand_results_6m.txt
+   ```
+
+3. Transcribe the sample file with bin packing and optional VAD:
+
+   ```bash
+   python inference_gigaam.py ilya_6m_test.wav transcript.json \
+       --model v2_rnnt --lang ru --chunk_sec 22 --overlap_sec 1.0 \
+       --vad_silero --silero_model_dir /path/to/silero-vad
+   ```
+
+   - `--vad_silero` toggles Silero-based VAD (omit to disable).
+   - `--chunk_sec` and `--overlap_sec` control bin packing of speech segments.
+   - PyTorch uses the GPU automatically when available.
 
 ## Development
 All modules contain docstrings and are intended to be easy to extend. Run
