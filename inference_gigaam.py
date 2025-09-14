@@ -55,6 +55,7 @@ except Exception:
     _HAVE_TRANSFORMERS = False
 
 def _build_rupunct_pipeline(model_id: str = "RUPunct/RUPunct_big"):
+    """Create a HuggingFace pipeline for Russian punctuation restoration."""
     if not _HAVE_TRANSFORMERS:
         raise RuntimeError("transformers not available for RUPunct")
     tk = _AutoTokenizer.from_pretrained(model_id, strip_accents=False, add_prefix_space=True)
@@ -62,6 +63,7 @@ def _build_rupunct_pipeline(model_id: str = "RUPunct/RUPunct_big"):
     return clf
 
 def _rupunct_process_token(token: str, label: str) -> str:
+    """Apply punctuation/casing transformation to a single token."""
     # Mirror mapping from rupunct_apply.py
     mapping = {
         "LOWER_O": "",
@@ -113,6 +115,7 @@ def _rupunct_process_token(token: str, label: str) -> str:
     return token
 
 def _rupunct_fix_spaces(text: str) -> str:
+    """Normalize whitespace around punctuation marks."""
     import re as _re
     rules = [
         (_re.compile(r"\s+([,.;:!?—])"), r"\1"),
@@ -125,6 +128,7 @@ def _rupunct_fix_spaces(text: str) -> str:
     return out.strip()
 
 def _rupunct_text(clf, text: str) -> str:
+    """Run RUPunct on ``text`` using ``clf`` and return punctuated string."""
     if not text or not text.strip():
         return text
     preds = clf(text)
@@ -139,6 +143,7 @@ def _rupunct_text(clf, text: str) -> str:
 # ------------------------- Utilities & Env -------------------------
 
 def configure_local_caches() -> Path:
+    """Configure cache directories for torch and temporary files."""
     repo_root = Path(__file__).resolve().parents[1]
     os.environ.setdefault("TORCH_HOME", str(repo_root / ".torch"))
     tmp = str(repo_root / ".tmp")
@@ -150,11 +155,13 @@ def configure_local_caches() -> Path:
 
 
 def require_cuda():
+    """Raise an error if CUDA is not available."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required. CPU inference is disabled.")
 
 
 def vram_report(tag: str) -> None:
+    """Print a brief GPU memory usage report tagged with ``tag``."""
     try:
         dev = torch.cuda.current_device()
         total = torch.cuda.get_device_properties(dev).total_memory
@@ -168,6 +175,7 @@ def vram_report(tag: str) -> None:
 
 
 def acquire_gpu_lock(lock_path: Path, timeout_s: int = 120) -> tuple[bool, int]:
+    """Attempt to create a file lock to coordinate GPU usage."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     pid = os.getpid()
     start = time.time()
@@ -186,6 +194,7 @@ def acquire_gpu_lock(lock_path: Path, timeout_s: int = 120) -> tuple[bool, int]:
 
 
 def release_gpu_lock(lock_path: Path, owner_pid: int) -> None:
+    """Release a file lock created with :func:`acquire_gpu_lock`."""
     try:
         if lock_path.exists():
             try:
@@ -200,6 +209,7 @@ def release_gpu_lock(lock_path: Path, owner_pid: int) -> None:
 
 
 def _format_ts(sec: float) -> str:
+    """Format seconds as ``HH:MM:SS.mmm``."""
     if sec < 0:
         sec = 0.0
     ms = int(round(sec * 1000))
@@ -213,6 +223,7 @@ def _format_ts(sec: float) -> str:
 
 
 def _is_dense(text: str, dur: float) -> bool:
+    """Heuristic to skip segments with too little text for their duration."""
     wps = len(text.split()) / max(dur, 1e-9)
     cps = len(text) / max(dur, 1e-9)
     return (wps >= 1.0) or (cps >= 3.0)
@@ -221,6 +232,7 @@ def _is_dense(text: str, dur: float) -> bool:
 # ------------------------- Audio I/O helpers -------------------------
 
 def _get_duration_sec(path: Path) -> Optional[float]:
+    """Return audio duration in seconds using ``soundfile`` metadata."""
     try:
         info = sf.info(str(path))
         if info.samplerate and info.frames:
@@ -477,6 +489,7 @@ def slice_with_silero_vad(
 
 
 def _write_wav(tmpdir: Path, stem: str, audio: np.ndarray, sr: int, idx: int) -> Path:
+    """Write ``audio`` to a temporary WAV file and return its path."""
     p = tmpdir / f"{stem}_chunk_{idx:05d}.wav"
     sf.write(str(p), audio, sr)
     return p
@@ -519,9 +532,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
                                silero_speech_pad_ms: int = 35,
                                silero_cuda: bool = False,
                                ) -> tuple[str, list[dict], list[str]]:
-    """
-    Returns (full_text, segments). segments is list of dicts with start,end,text.
-    """
+    """Transcribe ``path`` sequentially and return full text and segment info."""
     src = _preconvert_if_needed(path, repo_root, force=False)
     audio, sr = sf.read(str(src))
     if audio.ndim > 1:
@@ -644,6 +655,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
 # ------------------------- CLI -------------------------
 
 def main():
+    """Command-line interface for chunked GigaAM transcription."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=str, help="Path to audio file/dir or JSONL/JSON manifest")
     parser.add_argument("output", type=str, help="Path to output JSON file")

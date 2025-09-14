@@ -1,9 +1,14 @@
+"""Utilities for splitting audio into overlapping energy-based chunks."""
+
 import numpy as np
 from typing import List, Tuple
 
+
 class ChunkingProcessor:
-    def __init__(self, chunk_sec=22.0, overlap_sec=1.0, 
-                 search_silence_sec=0.6, silence_abs=0.0, 
+    """Split audio into chunks using a simple energy envelope heuristic."""
+
+    def __init__(self, chunk_sec=22.0, overlap_sec=1.0,
+                 search_silence_sec=0.6, silence_abs=0.0,
                  silence_peak_ratio=0.002, frame_ms=20.0):
         self.chunk_sec = chunk_sec
         self.overlap_sec = overlap_sec
@@ -13,9 +18,11 @@ class ChunkingProcessor:
         self.frame_ms = frame_ms
 
     def process(self, audio: np.ndarray, sr: int) -> List[Tuple[int, int]]:
+        """Return chunk boundaries for the given audio and sample rate."""
         return self.slice_into_chunks(audio, sr)
 
     def _compute_energy_envelope(self, audio: np.ndarray, frame_len: int, hop_len: int) -> np.ndarray:
+        """Compute short-time RMS energy envelope for mono audio."""
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
         n = len(audio)
@@ -32,8 +39,9 @@ class ChunkingProcessor:
             out[i] = float(np.sqrt(np.mean(w * w) + 1e-12))
         return out
 
-    def _find_cut_near(self, target_samp: int, sr: int, env: np.ndarray, 
+    def _find_cut_near(self, target_samp: int, sr: int, env: np.ndarray,
                       frame_len: int, hop_len: int, search_sec: float, thr: float) -> int:
+        """Find a near-silence cut point close to ``target_samp``."""
         target_frame = max(0, min(len(env) - 1, target_samp // hop_len))
         radius = max(1, int(round(search_sec * sr / hop_len)))
         lo = max(0, target_frame - radius)
@@ -48,6 +56,7 @@ class ChunkingProcessor:
         return target_samp
 
     def slice_into_chunks(self, audio: np.ndarray, sr: int) -> List[Tuple[int, int]]:
+        """Return list of ``(start, end)`` sample indices for each chunk."""
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
         n = len(audio)
