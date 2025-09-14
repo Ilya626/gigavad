@@ -263,6 +263,7 @@ def _preconvert_if_needed(path: Path, repo_root: Path, force: bool = False) -> P
 
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
+        print("[preconvert] ffmpeg not found, proceeding without conversion")
         # fallback: try to write as-is; model may still cope
         return path
 
@@ -285,7 +286,6 @@ def _preconvert_if_needed(path: Path, repo_root: Path, force: bool = False) -> P
 
 # ------------------------- Chunking logic (no VAD deps) -------------------------
 
-@dataclass
 @dataclass
 class SileroParams:
     threshold: float = 0.65
@@ -497,11 +497,12 @@ def transcribe_file_sequential(
     """Transcribe ``path`` sequentially and return full text and segment info."""
     src = _preconvert_if_needed(path, repo_root, force=False)
     audio, sr = sf.read(str(src))
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
+    if sr != 16000 or audio.ndim != 1:
+        print(f"[audio] expected 16000Hz mono, got sr={sr}, ndim={audio.ndim}")
+        return "", [], []
     n = len(audio)
     if n == 0:
-        return "", []
+        return "", [], []
 
     vad_cfg = vad_cfg or VadConfig()
 
