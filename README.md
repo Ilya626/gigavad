@@ -36,6 +36,10 @@ Increasing `--vad_pad_ms` adds the specified milliseconds of context before and
 after every VAD segment prior to bin packing. This extra margin helps prevent
 words from being truncated at chunk boundaries, improving boundary safety.
 
+Use `--vad_min_bin_speech` to require a minimum amount of speech in each VAD
+bin. If a gap or duration limit would close the bin early, segments are merged
+with subsequent ones until this threshold is reached.
+
 To run plain VAD and save detected segments:
 
 ```bash
