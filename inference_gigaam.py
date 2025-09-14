@@ -677,32 +677,80 @@ def transcribe_file_sequential(
 
 # ------------------------- CLI -------------------------
 
-def main():
-    """Command-line interface for chunked GigaAM transcription."""
+def parse_args() -> argparse.Namespace:
+    """Build argument parser and return parsed arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=str, help="Path to audio file/dir or JSONL/JSON manifest")
     parser.add_argument("output", type=str, help="Path to output JSON file")
     parser.add_argument("--model", default="v2_rnnt", help="Model type: v2_rnnt, v2_ctc, rnnt, ctc, etc.")
     parser.add_argument("--lang", type=str, default="", help="Force language code, e.g. 'ru' or 'en'. Empty=auto")
-    parser.add_argument("--output_format", choices=["json", "txt"], default="json",
-                        help="Output format: json (default) or txt")
-    parser.add_argument("--output_report", type=str, default="transcript_results.txt",
-                        help="Path for text report when using --output_format txt")
-
-    # chunking params
-    parser.add_argument("--chunk_sec", type=float, default=22.0, help="Target chunk length (seconds)")
-    parser.add_argument("--overlap_sec", type=float, default=1.0, help="Overlap between chunks (seconds)")
-    parser.add_argument("--search_silence_sec", type=float, default=0.6, help="Search window near boundary to cut at silence (seconds)")
-    parser.add_argument("--frame_ms", type=float, default=20.0, help="Frame size for energy envelope (ms)")
-    parser.add_argument("--silence_threshold", type=float, default=0.0, help="Absolute RMS threshold; 0=use peak ratio")
-    parser.add_argument("--silence_peak_ratio", type=float, default=0.002, help="Threshold = global_peak * ratio when absolute=0")
-    parser.add_argument("--no_adaptive", action="store_true", help="Disable adaptive noise-floor thresholding")
-
-    # VAD options
-    parser.add_argument("--target_speech_sec", type=float, default=22.0, help="Target speech seconds per bin (no word cuts)")
-    parser.add_argument("--vad_max_overshoot", type=float, default=1.0, help="Allowable overshoot beyond target speech per bin (sec)")
-    parser.add_argument("--vad_max_silence_within", type=float, default=1.2, help="Max silence gap allowed inside a bin (sec)")
     parser.add_argument(
+        "--output_format",
+        choices=["json", "txt"],
+        default="json",
+        help="Output format: json (default) or txt",
+    )
+    parser.add_argument(
+        "--output_report",
+        type=str,
+        default="transcript_results.txt",
+        help="Path for text report when using --output_format txt",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="",
+        help="Optional JSON config file with argument values",
+    )
+
+    chunk_group = parser.add_argument_group("Chunking")
+    chunk_group.add_argument("--chunk_sec", type=float, default=22.0, help="Target chunk length (seconds)")
+    chunk_group.add_argument("--overlap_sec", type=float, default=1.0, help="Overlap between chunks (seconds)")
+    chunk_group.add_argument(
+        "--search_silence_sec",
+        type=float,
+        default=0.6,
+        help="Search window near boundary to cut at silence (seconds)",
+    )
+    chunk_group.add_argument("--frame_ms", type=float, default=20.0, help="Frame size for energy envelope (ms)")
+    chunk_group.add_argument(
+        "--silence_threshold",
+        type=float,
+        default=0.0,
+        help="Absolute RMS threshold; 0=use peak ratio",
+    )
+    chunk_group.add_argument(
+        "--silence_peak_ratio",
+        type=float,
+        default=0.002,
+        help="Threshold = global_peak * ratio when absolute=0",
+    )
+    chunk_group.add_argument(
+        "--no_adaptive",
+        action="store_true",
+        help="Disable adaptive noise-floor thresholding",
+    )
+
+    vad_group = parser.add_argument_group("VAD")
+    vad_group.add_argument(
+        "--target_speech_sec",
+        type=float,
+        default=22.0,
+        help="Target speech seconds per bin (no word cuts)",
+    )
+    vad_group.add_argument(
+        "--vad_max_overshoot",
+        type=float,
+        default=1.0,
+        help="Allowable overshoot beyond target speech per bin (sec)",
+    )
+    vad_group.add_argument(
+        "--vad_max_silence_within",
+        type=float,
+        default=1.2,
+        help="Max silence gap allowed inside a bin (sec)",
+    )
+    vad_group.add_argument(
         "--vad_min_bin_speech",
         type=float,
         default=10.0,
@@ -711,7 +759,7 @@ def main():
             " ignored until this is satisfied (sec)"
         ),
     )
-    parser.add_argument(
+    vad_group.add_argument(
         "--vad_min_gap_sec",
         type=float,
         default=0.3,
@@ -720,56 +768,139 @@ def main():
             " Gaps smaller than this merge when --vad_merge_segs is used"
         ),
     )
-    parser.add_argument("--vad_cut_search_sec", type=float, default=2.0, help="Search window around target for internal pause cut (sec)")
-    parser.add_argument("--vad_pad_ms", type=int, default=0,
-                        help="Padding added to each VAD segment before binning (ms)")
-    parser.add_argument(
+    vad_group.add_argument(
+        "--vad_cut_search_sec",
+        type=float,
+        default=2.0,
+        help="Search window around target for internal pause cut (sec)",
+    )
+    vad_group.add_argument(
+        "--vad_pad_ms",
+        type=int,
+        default=0,
+        help="Padding added to each VAD segment before binning (ms)",
+    )
+    vad_group.add_argument(
         "--vad_merge_segs",
         action="store_true",
         help="Merge adjacent VAD segments separated by less than --vad_min_gap_sec",
     )
 
-    # Silero VAD options (Windows-friendly, no Triton)
-    parser.add_argument("--vad_silero", action="store_true", help="Use Silero VAD (torch.hub) for chunking into ~22s speech bins")
-    parser.add_argument("--silero_threshold", type=float, default=0.65, help="Silero VAD threshold")
-    parser.add_argument("--silero_min_speech_ms", type=int, default=200, help="Minimum speech duration in ms")
-    parser.add_argument("--silero_min_silence_ms", type=int, default=250, help="Minimum silence to separate speech in ms")
-    parser.add_argument("--silero_speech_pad_ms", type=int, default=35, help="Padding around detected speech in ms")
-    parser.add_argument("--silero_cuda", action="store_true", help="Run Silero VAD on CUDA if available")
-    parser.add_argument("--silero_model_dir", type=str, default="", help="Directory with local Silero VAD model")
+    silero_group = parser.add_argument_group("Silero VAD")
+    silero_group.add_argument(
+        "--vad_silero",
+        action="store_true",
+        help="Use Silero VAD (torch.hub) for chunking into ~22s speech bins",
+    )
+    silero_group.add_argument(
+        "--silero_threshold", type=float, default=0.65, help="Silero VAD threshold"
+    )
+    silero_group.add_argument(
+        "--silero_min_speech_ms",
+        type=int,
+        default=200,
+        help="Minimum speech duration in ms",
+    )
+    silero_group.add_argument(
+        "--silero_min_silence_ms",
+        type=int,
+        default=250,
+        help="Minimum silence to separate speech in ms",
+    )
+    silero_group.add_argument(
+        "--silero_speech_pad_ms",
+        type=int,
+        default=35,
+        help="Padding around detected speech in ms",
+    )
+    silero_group.add_argument(
+        "--silero_cuda",
+        action="store_true",
+        help="Run Silero VAD on CUDA if available",
+    )
+    silero_group.add_argument(
+        "--silero_model_dir",
+        type=str,
+        default="",
+        help="Directory with local Silero VAD model",
+    )
 
-    # dedup params
-    parser.add_argument("--dedup_tail_chars", type=int, default=80, help="How many trailing chars from previous text to compare")
-    parser.add_argument(
+    dedup_group = parser.add_argument_group("Deduplication")
+    dedup_group.add_argument(
+        "--dedup_tail_chars",
+        type=int,
+        default=80,
+        help="How many trailing chars from previous text to compare",
+    )
+    dedup_group.add_argument(
         "--min_dedup_overlap",
         type=int,
         default=16,
         help="Min token overlap to consider as duplication",
     )
 
-    parser.add_argument(
+    filt_group = parser.add_argument_group("Filtering")
+    filt_group.add_argument(
         "--min_wps",
         type=float,
         default=1.0,
         help="Minimum words-per-second to keep a segment",
     )
-    parser.add_argument(
+    filt_group.add_argument(
         "--min_cps",
         type=float,
         default=3.0,
         help="Minimum characters-per-second to keep a segment",
     )
 
-    # batching / misc
-    parser.add_argument("--batch_size", type=int, default=16, help="Files per loop batch (I/O grouping)")
-    parser.add_argument("--sample", type=int, default=0, help="Sample N files from manifest (0=all)")
-    parser.add_argument("--write_segments", type=str, default="", help="Optional JSONL file to write segments with timestamps")
-    parser.add_argument("--write_segments_punct", type=str, default="", help="Optional JSONL to write segments with punctuation (text_punct)")
-    parser.add_argument("--punct_ru", action="store_true", help="Apply RUPunct to segment texts and write text_punct")
-    parser.add_argument("--no_lock", action="store_true", help="Do not acquire GPU lock")
-    parser.add_argument("--use_tempfile", action="store_true", help="Use legacy temp files for model input")
-    parser.add_argument("--debug", action="store_true", help="Debug prints")
+    misc_group = parser.add_argument_group("Misc")
+    misc_group.add_argument(
+        "--batch_size", type=int, default=16, help="Files per loop batch (I/O grouping)"
+    )
+    misc_group.add_argument(
+        "--sample", type=int, default=0, help="Sample N files from manifest (0=all)"
+    )
+    misc_group.add_argument(
+        "--write_segments",
+        type=str,
+        default="",
+        help="Optional JSONL file to write segments with timestamps",
+    )
+    misc_group.add_argument(
+        "--write_segments_punct",
+        type=str,
+        default="",
+        help="Optional JSONL to write segments with punctuation (text_punct)",
+    )
+    misc_group.add_argument(
+        "--punct_ru",
+        action="store_true",
+        help="Apply RUPunct to segment texts and write text_punct",
+    )
+    misc_group.add_argument(
+        "--no_lock", action="store_true", help="Do not acquire GPU lock"
+    )
+    misc_group.add_argument(
+        "--use_tempfile",
+        action="store_true",
+        help="Use legacy temp files for model input",
+    )
+    misc_group.add_argument("--debug", action="store_true", help="Debug prints")
+
     args = parser.parse_args()
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        for key, val in cfg.items():
+            if hasattr(args, key) and getattr(args, key) == parser.get_default(key):
+                setattr(args, key, val)
+    return args
+
+
+def main():
+    """Command-line interface for chunked GigaAM transcription."""
+    args = parse_args()
+
 
     repo_root = configure_local_caches()
     require_cuda()
