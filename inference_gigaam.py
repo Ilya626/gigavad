@@ -314,6 +314,11 @@ def slice_with_silero_vad(
         Sample rate of ``audio``.
     audio:
         Mono audio samples.
+    min_bin_speech_sec:
+        Minimum speech (seconds) required before a bin can be closed. If a
+        silence gap or duration limit would normally finalize the bin but the
+        accumulated speech is below this threshold, the segments are retained
+        and combined with subsequent ones until the requirement is met.
     pad_context_ms:
         Extra padding applied to each detected speech segment before bin
         packing (milliseconds). Provides additional context to reduce the risk
@@ -374,15 +379,26 @@ def slice_with_silero_vad(
         seg_duration = e - s
         if cur_bin:
             gap = s - (last_end if last_end is not None else s)
-            if gap > max_silence_within_sec or (cur_speech + seg_duration) > (target_speech_sec + max_overshoot_sec):
-                bins.append(cur_bin)
-                cur_bin = []
-                cur_speech = 0.0
+            if gap > max_silence_within_sec or (
+                (cur_speech + seg_duration) > (target_speech_sec + max_overshoot_sec)
+            ):
+                if cur_speech >= min_bin_speech_sec:
+                    bins.append(cur_bin)
+                    cur_bin = []
+                    cur_speech = 0.0
+                # else: keep accumulating despite gap/overshoot until threshold
         cur_bin.append((s, e))
         cur_speech += seg_duration
         last_end = e
     if cur_bin:
         bins.append(cur_bin)
+
+    if min_bin_speech_sec > 0:
+        for b in bins[:-1]:  # last bin may be shorter
+            speech = sum(e - s for s, e in b)
+            assert speech >= min_bin_speech_sec, (
+                f"Bin speech {speech:.2f}s shorter than {min_bin_speech_sec}s"
+            )
 
     out: list[tuple[int, int]] = []
     for bin_segs in bins:
@@ -595,7 +611,15 @@ def main():
     parser.add_argument("--target_speech_sec", type=float, default=22.0, help="Target speech seconds per bin (no word cuts)")
     parser.add_argument("--vad_max_overshoot", type=float, default=1.0, help="Allowable overshoot beyond target speech per bin (sec)")
     parser.add_argument("--vad_max_silence_within", type=float, default=1.2, help="Max silence gap allowed inside a bin (sec)")
-    parser.add_argument("--vad_min_bin_speech", type=float, default=10.0, help="Min speech per bin before early close (sec)")
+    parser.add_argument(
+        "--vad_min_bin_speech",
+        type=float,
+        default=10.0,
+        help=(
+            "Minimum speech per bin before it can be closed; gaps/overshoot are"
+            " ignored until this is satisfied (sec)"
+        ),
+    )
     parser.add_argument("--vad_min_gap_sec", type=float, default=0.3, help="Minimum internal pause to split long speech (sec)")
     parser.add_argument("--vad_cut_search_sec", type=float, default=2.0, help="Search window around target for internal pause cut (sec)")
     parser.add_argument("--vad_pad_ms", type=int, default=0,
