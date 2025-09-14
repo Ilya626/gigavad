@@ -281,89 +281,6 @@ def _preconvert_if_needed(path: Path, repo_root: Path, force: bool = False) -> P
 
 # ------------------------- Chunking logic (no VAD deps) -------------------------
 
-def _compute_energy_envelope(audio: np.ndarray, frame_len: int, hop_len: int) -> np.ndarray:
-    """Short-time RMS energy envelope."""
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    n = len(audio)
-    if n <= 0:
-        return np.zeros(0, dtype=np.float32)
-    # Pad left/right to fit frames
-    pad = (frame_len - (n - frame_len) % hop_len) % hop_len
-    x = np.pad(audio.astype(np.float32, copy=False), (0, pad))
-    frames = 1 + (len(x) - frame_len) // hop_len
-    out = np.empty(frames, dtype=np.float32)
-    for i in range(frames):
-        s = i * hop_len
-        e = s + frame_len
-        w = x[s:e]
-        out[i] = float(np.sqrt(np.mean(w * w) + 1e-12))
-    return out
-
-
-def _find_cut_near(target_samp: int, sr: int, env: np.ndarray, frame_len: int, hop_len: int,
-                   search_sec: float, thr: float) -> int:
-    """Search for lowest-energy frame near target and cut there if below thr; else target."""
-    if target_samp <= 0:
-        return 0
-    target_frame = max(0, min(len(env) - 1, target_samp // hop_len))
-    radius = max(1, int(round(search_sec * sr / hop_len)))
-    lo = max(0, target_frame - radius)
-    hi = min(len(env) - 1, target_frame + radius)
-    window = env[lo:hi + 1]
-    if window.size == 0:
-        return target_samp
-    idx_rel = int(np.argmin(window))
-    if window[idx_rel] <= thr:
-        best_frame = lo + idx_rel
-        return best_frame * hop_len
-    return target_samp
-
-
-def slice_into_chunks(audio: np.ndarray, sr: int,
-                      chunk_sec: float, overlap_sec: float,
-                      search_silence_sec: float,
-                      silence_abs: float,
-                      silence_peak_ratio: float,
-                      frame_ms: float,
-                      min_chunk_sec: float = 3.0) -> List[Tuple[int, int]]:
-    """
-    Create chunk [start,end) sample indices with overlap, seeking silence near boundaries.
-    Silence threshold is max(silence_abs, global_peak * silence_peak_ratio).
-    """
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    n = len(audio)
-    if n == 0:
-        return []
-
-    frame_len = max(1, int(round(sr * frame_ms / 1000.0)))
-    hop_len = frame_len // 2  # 50% overlap for smoother envelope
-    env = _compute_energy_envelope(audio, frame_len, hop_len)
-    peak = float(np.max(np.abs(audio))) if n else 0.0
-    thr = max(1e-7, float(silence_abs) if silence_abs > 0 else peak * float(silence_peak_ratio))
-
-    chunk_len = int(round(chunk_sec * sr))
-    overlap = int(round(overlap_sec * sr))
-    min_len = int(round(min_chunk_sec * sr))
-    search_sec = float(search_silence_sec)
-
-    chunks: List[Tuple[int, int]] = []
-    start = 0
-    while start < n:
-        raw_end = min(n, start + chunk_len)
-        # find better boundary near raw_end
-        cut = _find_cut_near(raw_end, sr, env, frame_len, hop_len, search_sec, thr)
-        end = min(n, max(start + min_len, cut))
-        if end <= start:
-            end = min(n, start + chunk_len)  # fallback
-        chunks.append((start, end))
-        if end >= n:
-            break
-        # next start with overlap
-        start = max(0, end - overlap)
-
-    return chunks
 
 
 
@@ -401,62 +318,27 @@ def slice_with_silero_vad(
     )
     segs = vad_processor.process(audio, sr)
 
-    # ensure segments > target_speech_sec are split at internal pauses
-    frame_len = max(1, int(round(sr * frame_ms / 1000.0)))
-    hop_len = max(1, frame_len // 2)
-    env = _compute_energy_envelope(audio, frame_len, hop_len)
-    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
-    thr = max(1e-7, float(silence_abs) if silence_abs > 0 else peak * float(silence_peak_ratio))
-
-    def find_silence_cut_near(target_s: float) -> float:
-        target_samp = int(round(target_s * sr))
-        if target_samp <= 0:
-            return 0.0
-        target_frame = max(0, min(len(env) - 1, target_samp // hop_len))
-        radius = max(1, int(round(cut_search_sec * sr / hop_len)))
-        lo = max(0, target_frame - radius)
-        hi = min(len(env) - 1, target_frame + radius)
-        if hi <= lo:
-            return target_s
-        silent = env[lo:hi + 1] <= thr
-        need = max(1, int(round(min_gap_sec * sr / hop_len)))
-        best_center = None
-        run_len = 0
-        start_idx = 0
-        for i, v in enumerate(silent):
-            if v:
-                if run_len == 0:
-                    start_idx = i
-                run_len += 1
-            if (not v) or i == len(silent) - 1:
-                if v and i == len(silent) - 1:
-                    pass
-                if run_len >= need:
-                    center = start_idx + run_len // 2
-                    best_center = center
-                    break
-                run_len = 0
-        if best_center is not None:
-            cut_frame = lo + best_center
-            return (cut_frame * hop_len) / sr
-        cut = _find_cut_near(target_samp, sr, env, frame_len, hop_len, cut_search_sec, thr)
-        return cut / sr
+    # ensure segments > target_speech_sec are split using ChunkingProcessor
+    cp_split = ChunkingProcessor(
+        chunk_sec=target_speech_sec,
+        overlap_sec=0.0,
+        search_silence_sec=cut_search_sec,
+        silence_abs=silence_abs,
+        silence_peak_ratio=silence_peak_ratio,
+        frame_ms=frame_ms,
+    )
 
     refined: list[tuple[float, float]] = []
     for s, e in segs:
         if e - s <= target_speech_sec:
             refined.append((s, e))
             continue
-        cur = s
-        while (e - cur) > target_speech_sec:
-            desired = cur + target_speech_sec
-            cut_t = find_silence_cut_near(desired)
-            if cut_t <= cur + 0.1:
-                cut_t = cur + target_speech_sec
-            refined.append((cur, min(cut_t, e)))
-            cur = cut_t
-        if cur < e:
-            refined.append((cur, e))
+        seg_audio = audio[int(round(s * sr)): int(round(e * sr))]
+        sub_chunks = cp_split.process(seg_audio, sr)
+        for ss, ee in sub_chunks:
+            start_t = s + ss / sr
+            end_t = s + ee / sr
+            refined.append((start_t, min(end_t, e)))
     segs = refined
 
     # Pack segments into bins considering gaps and max duration
@@ -571,13 +453,21 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
     if chunks is None:
         # If VAD was requested but failed, honor target_speech_sec as time target
         time_target = float(target_speech_sec) if use_vad_silero else float(chunk_sec)
-        chunks = slice_into_chunks(audio, sr, time_target, overlap_sec,
-                                   search_silence_sec, silence_abs, silence_peak_ratio,
-                                   frame_ms)
+        cp = ChunkingProcessor(
+            chunk_sec=time_target,
+            overlap_sec=overlap_sec,
+            search_silence_sec=search_silence_sec,
+            silence_abs=silence_abs,
+            silence_peak_ratio=silence_peak_ratio,
+            frame_ms=frame_ms,
+        )
+        chunks = cp.process(audio, sr)
     if debug:
-        print(f"[CHUNKS] {path.name}: {len(chunks)} chunks; sr={sr}; "
-              f"chunkв‰€{chunk_sec}s ovlp={overlap_sec}s search={search_silence_sec}s "
-              f"thr(abs={silence_abs}, peak_ratio={silence_peak_ratio})")
+        print(
+            f"[CHUNKS] {path.name}: {len(chunks)} chunks; sr={sr}; "
+            f"chunk≈{time_target}s ovlp={overlap_sec}s search={search_silence_sec}s "
+            f"thr(abs={silence_abs}, peak_ratio={silence_peak_ratio})"
+        )
 
     tmpdir = Path(tempfile.gettempdir()) / "gigaam_chunks_seq"
     tmpdir.mkdir(parents=True, exist_ok=True)
