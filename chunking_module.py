@@ -5,17 +5,38 @@ from typing import List, Tuple
 
 
 class ChunkingProcessor:
-    """Split audio into chunks using a simple energy envelope heuristic."""
+    """Split audio into chunks using a simple energy envelope heuristic.
+
+    Parameters
+    ----------
+    chunk_sec:
+        Target chunk length in seconds.
+    overlap_sec:
+        Overlap between consecutive chunks in seconds.
+    search_silence_sec:
+        Radius around a boundary to search for a lower-energy cut.
+    silence_abs:
+        Absolute RMS threshold for silence.
+    silence_peak_ratio:
+        When ``silence_abs`` is zero, use ``global_peak * silence_peak_ratio``.
+    frame_ms:
+        Frame size for energy envelope in milliseconds.
+    adaptive:
+        If ``True`` (default), estimate a noise floor from the energy envelope
+        and include it when computing the silence threshold.
+    """
 
     def __init__(self, chunk_sec=22.0, overlap_sec=1.0,
                  search_silence_sec=0.6, silence_abs=0.0,
-                 silence_peak_ratio=0.002, frame_ms=20.0):
+                 silence_peak_ratio=0.002, frame_ms=20.0,
+                 adaptive: bool = True):
         self.chunk_sec = chunk_sec
         self.overlap_sec = overlap_sec
         self.search_silence_sec = search_silence_sec
         self.silence_abs = silence_abs
         self.silence_peak_ratio = silence_peak_ratio
         self.frame_ms = frame_ms
+        self.adaptive = adaptive
 
     def process(self, audio: np.ndarray, sr: int) -> List[Tuple[int, int]]:
         """Return chunk boundaries for the given audio and sample rate."""
@@ -56,7 +77,12 @@ class ChunkingProcessor:
         return target_samp
 
     def slice_into_chunks(self, audio: np.ndarray, sr: int) -> List[Tuple[int, int]]:
-        """Return list of ``(start, end)`` sample indices for each chunk."""
+        """Return list of ``(start, end)`` sample indices for each chunk.
+
+        When ``adaptive`` is ``True``, an estimate of the noise floor from
+        the lower quantile of the energy envelope is included when computing
+        the silence threshold.
+        """
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
         n = len(audio)
@@ -67,7 +93,11 @@ class ChunkingProcessor:
         hop_len = frame_len // 2
         env = self._compute_energy_envelope(audio, frame_len, hop_len)
         peak = float(np.max(np.abs(audio))) if n else 0.0
-        thr = max(1e-7, float(self.silence_abs) if self.silence_abs > 0 else peak * float(self.silence_peak_ratio))
+        noise_floor = float(np.quantile(env, 0.1)) if env.size else 0.0
+        if self.adaptive:
+            thr = max(1e-7, float(self.silence_abs), peak * float(self.silence_peak_ratio), noise_floor)
+        else:
+            thr = max(1e-7, float(self.silence_abs) if self.silence_abs > 0 else peak * float(self.silence_peak_ratio))
 
         chunk_len = int(round(self.chunk_sec * sr))
         overlap = int(round(self.overlap_sec * sr))
