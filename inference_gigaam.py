@@ -306,6 +306,7 @@ def slice_with_silero_vad(
     silence_peak_ratio: float = 0.002,
     adaptive: bool = True,
     silero_model_dir: Optional[str] = None,
+    merge_close_segs: bool = False,
 ) -> List[Tuple[int, int]]:
     """Compute chunks via Silero VAD and pack them into ≈22 s speech bins.
 
@@ -324,6 +325,9 @@ def slice_with_silero_vad(
         Extra padding applied to each detected speech segment before bin
         packing (milliseconds). Provides additional context to reduce the risk
         of cutting words at bin boundaries.
+    merge_close_segs:
+        If ``True``, merge adjacent VAD segments when the gap between them is
+        smaller than ``min_gap_sec`` before packing into bins.
     adaptive:
         Enable adaptive thresholding when splitting long segments.
     """
@@ -373,6 +377,16 @@ def slice_with_silero_vad(
             e = min(total_dur, e + pad)
             padded.append((s, e))
         segs = padded
+
+    if merge_close_segs and segs:
+        merged: list[tuple[float, float]] = [segs[0]]
+        for s, e in segs[1:]:
+            ps, pe = merged[-1]
+            if s - pe < min_gap_sec:
+                merged[-1] = (ps, e)
+            else:
+                merged.append((s, e))
+        segs = merged
 
     # Pack segments into bins considering gaps and max duration
     bins: list[list[tuple[float, float]]] = []
@@ -453,6 +467,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
                                vad_min_bin_speech: float = 10.0,
                                vad_cut_search_sec: float = 2.0,
                                vad_min_gap_sec: float = 0.3,
+                               vad_merge_segs: bool = False,
                                silero_threshold: float = 0.65,
                                silero_min_speech_ms: int = 200,
                                silero_min_silence_ms: int = 250,
@@ -490,6 +505,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
                 use_cuda=bool(silero_cuda),
                 cut_search_sec=float(vad_cut_search_sec),
                 min_gap_sec=float(vad_min_gap_sec),
+                merge_close_segs=bool(vad_merge_segs),
                 frame_ms=float(frame_ms),
                 silence_abs=float(silence_abs),
                 silence_peak_ratio=float(silence_peak_ratio),
@@ -628,10 +644,23 @@ def main():
             " ignored until this is satisfied (sec)"
         ),
     )
-    parser.add_argument("--vad_min_gap_sec", type=float, default=0.3, help="Minimum internal pause to split long speech (sec)")
+    parser.add_argument(
+        "--vad_min_gap_sec",
+        type=float,
+        default=0.3,
+        help=(
+            "Minimum pause considered a boundary (sec)."
+            " Gaps smaller than this merge when --vad_merge_segs is used"
+        ),
+    )
     parser.add_argument("--vad_cut_search_sec", type=float, default=2.0, help="Search window around target for internal pause cut (sec)")
     parser.add_argument("--vad_pad_ms", type=int, default=0,
                         help="Padding added to each VAD segment before binning (ms)")
+    parser.add_argument(
+        "--vad_merge_segs",
+        action="store_true",
+        help="Merge adjacent VAD segments separated by less than --vad_min_gap_sec",
+    )
 
     # Silero VAD options (Windows-friendly, no Triton)
     parser.add_argument("--vad_silero", action="store_true", help="Use Silero VAD (torch.hub) for chunking into ~22s speech bins")
@@ -772,6 +801,7 @@ def main():
                     float(args.vad_min_bin_speech),
                     float(args.vad_cut_search_sec),
                     float(args.vad_min_gap_sec),
+                    bool(args.vad_merge_segs),
                     float(args.silero_threshold),
                     int(args.silero_min_speech_ms),
                     int(args.silero_min_silence_ms),
