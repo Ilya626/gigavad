@@ -145,6 +145,31 @@ def _rupunct_text(clf, text: str) -> str:
 
 # ------------------------- Utilities & Env -------------------------
 
+def _safe_transcribe(model, source, lang: Optional[str] = None):
+    """Safely call model.transcribe with language if supported.
+
+    - Detects if the callable accepts a 'language' or 'lang' kwarg.
+    - Falls back to calling without language if not supported.
+    - 'source' can be a path string or a file-like buffer depending on the model.
+    """
+    fn = getattr(model, "transcribe", None)
+    if fn is None:
+        raise AttributeError("Model has no 'transcribe' method")
+    kwargs = {}
+    if lang:
+        try:
+            import inspect
+            sig = inspect.signature(fn)
+            params = sig.parameters
+            if "language" in params:
+                kwargs["language"] = lang
+            elif "lang" in params:
+                kwargs["lang"] = lang
+        except Exception:
+            # If we can't introspect, try without passing language
+            kwargs = {}
+    return fn(source, **kwargs)
+
 def configure_local_caches() -> Path:
     """Configure cache directories for torch and temporary files."""
     repo_root = Path(__file__).resolve().parent
@@ -513,6 +538,8 @@ def transcribe_file_sequential(
     min_cps: float = 3.0,
 ) -> tuple[str, list[dict], list[str]]:
     """Transcribe ``path`` sequentially and return full text and segment info."""
+    # Hardcode Russian language per project requirements
+    lang = "ru"
     src = _preconvert_if_needed(path, repo_root, force=False)
     audio, sr = sf.read(str(src))
     if sr != 16000 or audio.ndim != 1:
@@ -585,14 +612,11 @@ def transcribe_file_sequential(
             try:
                 try:
                     with torch.inference_mode():
-                        out = (
-                            model.transcribe(str(wav_path), language=lang)
-                            if lang
-                            else model.transcribe(str(wav_path))
-                        )
+                        out = _safe_transcribe(model, str(wav_path), lang)
                 except TypeError:
+                    # Some backends may still raise TypeError on buffer/path specifics; try without language
                     with torch.inference_mode():
-                        out = model.transcribe(str(wav_path))
+                        out = _safe_transcribe(model, str(wav_path), None)
             except Exception as e:
                 print(
                     f"[ERROR] transcribe chunk {i+1}/{len(chunks)} {path.name}: {e}"
@@ -619,11 +643,7 @@ def transcribe_file_sequential(
             try:
                 try:
                     with torch.inference_mode():
-                        out = (
-                            model.transcribe(buf, language=lang)
-                            if lang
-                            else model.transcribe(buf)
-                        )
+                        out = _safe_transcribe(model, buf, lang)
                 except TypeError:
                     # Fallback: model does not accept file-like objects.
                     tmpdir.mkdir(parents=True, exist_ok=True)
@@ -637,11 +657,7 @@ def transcribe_file_sequential(
                         tmp_path = Path(tmpf.name)
                     try:
                         with torch.inference_mode():
-                            out = (
-                                model.transcribe(str(tmp_path), language=lang)
-                                if lang
-                                else model.transcribe(str(tmp_path))
-                            )
+                            out = _safe_transcribe(model, str(tmp_path), lang)
                     finally:
                         try:
                             tmp_path.unlink(missing_ok=True)
