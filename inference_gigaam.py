@@ -190,8 +190,26 @@ def acquire_gpu_lock(lock_path: Path, timeout_s: int = 120) -> tuple[bool, int]:
             print(f"[LOCK] Acquired GPU lock at {lock_path}")
             return True, pid
         except FileExistsError:
+            try:
+                existing_pid = int(lock_path.read_text(encoding="utf-8").strip())
+                try:
+                    os.kill(existing_pid, 0)
+                except OSError:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except Exception:
+                pass
             time.sleep(1)
         except Exception:
+            try:
+                existing_pid = int(lock_path.read_text(encoding="utf-8").strip())
+                try:
+                    os.kill(existing_pid, 0)
+                except OSError:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except Exception:
+                pass
             time.sleep(1)
     return False, pid
 
