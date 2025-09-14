@@ -625,10 +625,27 @@ def transcribe_file_sequential(
                             if lang
                             else model.transcribe(buf)
                         )
-                except TypeError as e:
-                    raise RuntimeError(
-                        "model.transcribe does not support file-like objects. Use --use_tempfile to enable legacy mode."
-                    ) from e
+                except TypeError:
+                    # Fallback: model does not accept file-like objects.
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".wav",
+                        prefix=f"{path.stem}_chunk_",
+                        delete=False,
+                    ) as tmpf:
+                        sf.write(tmpf, seg_audio, sr, format="WAV")
+                        tmp_path = Path(tmpf.name)
+                    try:
+                        with torch.inference_mode():
+                            out = (
+                                model.transcribe(str(tmp_path), language=lang)
+                                if lang
+                                else model.transcribe(str(tmp_path))
+                            )
+                    finally:
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
             except Exception as e:
                 print(
                     f"[ERROR] transcribe chunk {i+1}/{len(chunks)} {path.name}: {e}"
