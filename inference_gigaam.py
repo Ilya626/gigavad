@@ -225,11 +225,11 @@ def _format_ts(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
-def _is_dense(text: str, dur: float) -> bool:
+def _is_dense(text: str, dur: float, min_wps: float = 1.0, min_cps: float = 3.0) -> bool:
     """Heuristic to skip segments with too little text for their duration."""
     wps = len(text.split()) / max(dur, 1e-9)
     cps = len(text) / max(dur, 1e-9)
-    return (wps >= 1.0) or (cps >= 3.0)
+    return (wps >= min_wps) or (cps >= min_cps)
 
 
 # ------------------------- Audio I/O helpers -------------------------
@@ -415,18 +415,26 @@ def slice_with_silero_vad(
     return out, segs
 
 
-def _dedup_suffix_prefix(prev_tail: str, new_text: str, min_overlap: int = 16) -> str:
+def _dedup_suffix_prefix(
+    prev_tail: str,
+    new_text: str,
+    min_overlap: int = 16,
+    similarity_threshold: float = 0.9,
+) -> str:
     """Remove repeated prefix of ``new_text`` if it duplicates suffix of ``prev_tail``.
 
     The comparison is performed on word tokens after Unicode normalization
     (``NFKC``) and punctuation preprocessing so that visually similar text or
     text with different punctuation/spacing still deduplicates correctly.
     ``min_overlap`` denotes the minimal number of tokens that must overlap in
-    order to trigger deduplication.
+    order to trigger deduplication. ``similarity_threshold`` specifies the
+    minimal ratio from :class:`difflib.SequenceMatcher` to treat two token
+    sequences as overlapping.
     """
 
     import re
     import unicodedata
+    from difflib import SequenceMatcher
 
     def _normalize_tokens(text: str) -> list[str]:
         text = unicodedata.normalize("NFKC", text)
@@ -440,7 +448,10 @@ def _dedup_suffix_prefix(prev_tail: str, new_text: str, min_overlap: int = 16) -
     b_tokens = _normalize_tokens(new_text)
     max_k = min(len(a_tokens), len(b_tokens), 200)  # safety limit
     for k in range(max_k, min_overlap - 1, -1):
-        if a_tokens[-k:] == b_tokens[:k]:
+        a_seq = a_tokens[-k:]
+        b_seq = b_tokens[:k]
+        ratio = SequenceMatcher(None, a_seq, b_seq).ratio()
+        if ratio >= similarity_threshold:
             # Determine character index in original new_text to cut from
             norm_new = unicodedata.normalize("NFKC", new_text)
             word_matches = list(re.finditer(r"\w+", norm_new))
@@ -466,16 +477,23 @@ def _dedup_suffix_prefix(prev_tail: str, new_text: str, min_overlap: int = 16) -
 
 # ------------------------- Main transcribe loop -------------------------
 
-def transcribe_file_sequential(model, path: Path, repo_root: Path,
-                               lang: Optional[str],
-                               chunk_sec: float, overlap_sec: float,
-                               search_silence_sec: float,
-                               vad_cfg: VadConfig | None,
-                               dedup_tail_chars: int, min_dedup_overlap: int,
-                               debug: bool,
-                               use_vad_silero: bool = False,
-                               use_tempfile: bool = False,
-                               ) -> tuple[str, list[dict], list[str]]:
+def transcribe_file_sequential(
+    model,
+    path: Path,
+    repo_root: Path,
+    lang: Optional[str],
+    chunk_sec: float,
+    overlap_sec: float,
+    search_silence_sec: float,
+    vad_cfg: VadConfig | None,
+    dedup_tail_chars: int,
+    min_dedup_overlap: int,
+    debug: bool,
+    use_vad_silero: bool = False,
+    use_tempfile: bool = False,
+    min_wps: float = 1.0,
+    min_cps: float = 3.0,
+) -> tuple[str, list[dict], list[str]]:
     """Transcribe ``path`` sequentially and return full text and segment info."""
     src = _preconvert_if_needed(path, repo_root, force=False)
     audio, sr = sf.read(str(src))
@@ -547,11 +565,31 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
                 sf.write(tmpf, seg_audio, sr, format="WAV")
                 wav_path = Path(tmpf.name)
             try:
-                with torch.inference_mode():
-                    out = model.transcribe(str(wav_path), language=lang) if lang else model.transcribe(str(wav_path))
-            except TypeError:
-                with torch.inference_mode():
-                    out = model.transcribe(str(wav_path))
+                try:
+                    with torch.inference_mode():
+                        out = (
+                            model.transcribe(str(wav_path), language=lang)
+                            if lang
+                            else model.transcribe(str(wav_path))
+                        )
+                except TypeError:
+                    with torch.inference_mode():
+                        out = model.transcribe(str(wav_path))
+            except Exception as e:
+                print(
+                    f"[ERROR] transcribe chunk {i+1}/{len(chunks)} {path.name}: {e}"
+                )
+                try:
+                    wav_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                segments.append({"start": s0 / sr, "end": s1 / sr, "text": ""})
+                gc.collect()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                continue
             try:
                 wav_path.unlink(missing_ok=True)
             except Exception:
@@ -561,12 +599,28 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
             sf.write(buf, seg_audio, sr, format="WAV")
             buf.seek(0)
             try:
-                with torch.inference_mode():
-                    out = model.transcribe(buf, language=lang) if lang else model.transcribe(buf)
-            except TypeError as e:
-                raise RuntimeError(
-                    "model.transcribe does not support file-like objects. Use --use_tempfile to enable legacy mode."
-                ) from e
+                try:
+                    with torch.inference_mode():
+                        out = (
+                            model.transcribe(buf, language=lang)
+                            if lang
+                            else model.transcribe(buf)
+                        )
+                except TypeError as e:
+                    raise RuntimeError(
+                        "model.transcribe does not support file-like objects. Use --use_tempfile to enable legacy mode."
+                    ) from e
+            except Exception as e:
+                print(
+                    f"[ERROR] transcribe chunk {i+1}/{len(chunks)} {path.name}: {e}"
+                )
+                segments.append({"start": s0 / sr, "end": s1 / sr, "text": ""})
+                gc.collect()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                continue
 
         # extract text
         if isinstance(out, dict):
@@ -591,7 +645,7 @@ def transcribe_file_sequential(model, path: Path, repo_root: Path,
         tail = "".join(full_text_parts)[-dedup_tail_chars:] if full_text_parts else ""
         text = _dedup_suffix_prefix(tail, text, min_overlap=min_dedup_overlap)
         dur = (s1 - s0) / sr
-        if text and _is_dense(text, dur):
+        if text and _is_dense(text, dur, min_wps=min_wps, min_cps=min_cps):
             full_text_parts.append(text)
             segments.append({
                 "start": s0 / sr,
@@ -691,6 +745,19 @@ def main():
         type=int,
         default=16,
         help="Min token overlap to consider as duplication",
+    )
+
+    parser.add_argument(
+        "--min_wps",
+        type=float,
+        default=1.0,
+        help="Minimum words-per-second to keep a segment",
+    )
+    parser.add_argument(
+        "--min_cps",
+        type=float,
+        default=3.0,
+        help="Minimum characters-per-second to keep a segment",
     )
 
     # batching / misc
@@ -840,6 +907,7 @@ def main():
                     bool(args.debug),
                     bool(args.vad_silero),
                     bool(args.use_tempfile),
+                    float(args.min_wps), float(args.min_cps),
                 )
                 results[str(p)] = full_text
                 all_reports[str(p)] = comparison_lines
