@@ -147,13 +147,13 @@ def _rupunct_text(clf, text: str) -> str:
 
 def configure_local_caches() -> Path:
     """Configure cache directories for torch and temporary files."""
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parent
     os.environ.setdefault("TORCH_HOME", str(repo_root / ".torch"))
-    tmp = str(repo_root / ".tmp")
-    os.environ.setdefault("TMP", tmp)
-    os.environ.setdefault("TEMP", tmp)
+    tmp = repo_root / ".tmp"
+    for var in ("TMPDIR", "TMP", "TEMP"):
+        os.environ.setdefault(var, str(tmp))
     Path(os.environ["TORCH_HOME"]).mkdir(parents=True, exist_ok=True)
-    Path(tmp).mkdir(parents=True, exist_ok=True)
+    tmp.mkdir(parents=True, exist_ok=True)
     return repo_root
 
 
@@ -568,9 +568,8 @@ def transcribe_file_sequential(
             f"thr(abs={vad_cfg.chunk.silence_abs}, peak_ratio={vad_cfg.chunk.silence_peak_ratio})"
         )
 
-    tmpdir = None
+    tmpdir = repo_root / ".tmp" / "gigaam_chunks_seq"
     if use_tempfile:
-        tmpdir = Path(tempfile.gettempdir()) / "gigaam_chunks_seq"
         tmpdir.mkdir(parents=True, exist_ok=True)
     full_text_parts: List[str] = []
     segments: List[dict] = []
@@ -627,9 +626,11 @@ def transcribe_file_sequential(
                         )
                 except TypeError:
                     # Fallback: model does not accept file-like objects.
+                    tmpdir.mkdir(parents=True, exist_ok=True)
                     with tempfile.NamedTemporaryFile(
                         suffix=".wav",
                         prefix=f"{path.stem}_chunk_",
+                        dir=tmpdir,
                         delete=False,
                     ) as tmpf:
                         sf.write(tmpf, seg_audio, sr, format="WAV")
