@@ -1109,7 +1109,8 @@ def main():
             batch_paths = audio_files[i: i + bs]
             print(f"Transcribing batch {i // bs + 1} [{len(batch_paths)} files] ...")
             for p in batch_paths:
-                full_text, segments, _ = transcribe_file_sequential(
+
+                full_text, segments, comparison_lines = transcribe_file_sequential(
                     model,
                     p,
                     repo_root,
@@ -1139,25 +1140,20 @@ def main():
                             pass
                     segments_punct.append({**s, "text": text})
 
-                formatted_segments = [
-                    {
-                        "start": _format_mmss(sp["start"]),
-                        "end": _format_mmss(sp["end"]),
-                        "text": sp["text"],
-                    }
-                    for sp in segments_punct
-                    if sp["text"]
-                ]
+                # Full text is reconstructed from punctuated segments
+                full_text_punct = " ".join([seg["text"] for seg in segments_punct]).strip()
+                results[str(p)] = full_text_punct
+                all_reports[str(p)] = comparison_lines
 
-                for fs in formatted_segments:
-                    entry = {"audio": p.name, **fs}
-                    results.append(entry)
-                    report_lines.append(
-                        f"{p.name} ({fs['start']}-{fs['end']}) {fs['text']}"
-                    )
-                    if seg_writer:
-                        seg_writer.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
+                if seg_writer and segments_punct:
+                    for sp in segments_punct:
+                        obj = {
+                            "audio": str(p),
+                            "start": _format_ts(sp["start"]),
+                            "end": _format_ts(sp["end"]),
+                            "text": sp["text"],
+                        }
+                        seg_writer.write(json.dumps(obj, ensure_ascii=False) + "\n")
             vram_report(f"batch_{i // bs + 1}")
             gc.collect()
             try:
