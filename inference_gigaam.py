@@ -8,8 +8,9 @@ Chunked transcription for Salute GigaAM (no pyannote needed).
 - Feeds chunks sequentially to model.transcribe.
 - Deduplicates boundary repeats.
 - Works on single files, dirs, or JSON/JSONL manifests.
-- Outputs a JSON { "input_path": "full text" }.
-- Optional: write JSONL with segments [start,end,text].
+ - Outputs JSON array of speech segments with file name only, formatted
+   ``start``/``end`` times (MM:SS) and punctuated ``text``.
+- Optional: write segments as JSONL via ``--write_segments``.
 
 Example:
   python inference_gigaam_chunked.py Ilya_1_h.wav out/transcript.json \
@@ -266,6 +267,19 @@ def _format_ts(sec: float) -> str:
     s = ms // 1000
     ms %= 1000
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def _format_mmss(sec: float) -> str:
+    """Format seconds into ``MM:SS`` (or ``HH:MM:SS`` for long audio)."""
+    if sec < 0:
+        sec = 0.0
+    h = int(sec // 3600)
+    sec -= h * 3600
+    m = int(sec // 60)
+    s = int(sec - m * 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 def _is_dense(text: str, dur: float, min_wps: float = 1.0, min_cps: float = 3.0) -> bool:
@@ -1047,8 +1061,8 @@ def main():
         audio_files = audio_files[: args.sample]
 
     # Transcribe
-    results: dict[str, str] = {}
-    all_reports: dict[str, list[str]] = {}
+    results: List[dict] = []  # per-segment entries with audio/start/end/text
+    report_lines: List[str] = []
     seg_writer = None
     rupunct = None
     if args.write_segments:
@@ -1095,6 +1109,7 @@ def main():
             batch_paths = audio_files[i: i + bs]
             print(f"Transcribing batch {i // bs + 1} [{len(batch_paths)} files] ...")
             for p in batch_paths:
+
                 full_text, segments, comparison_lines = transcribe_file_sequential(
                     model,
                     p,
@@ -1139,7 +1154,6 @@ def main():
                             "text": sp["text"],
                         }
                         seg_writer.write(json.dumps(obj, ensure_ascii=False) + "\n")
-
             vram_report(f"batch_{i // bs + 1}")
             gc.collect()
             try:
@@ -1153,15 +1167,14 @@ def main():
         # Save main JSON output
         with out_path.open("w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
-            
+
         # Save text report if requested
         if args.output_format == "txt":
             report_path = Path(args.output_report)
             report_path.parent.mkdir(parents=True, exist_ok=True)
             with report_path.open("w", encoding="utf-8") as f:
-                for lines in all_reports.values():
-                    for line in lines:
-                        f.write(f"{line}\n")
+                for line in report_lines:
+                    f.write(f"{line}\n")
     finally:
         if seg_writer:
             seg_writer.close()
