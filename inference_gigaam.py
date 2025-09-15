@@ -2,42 +2,66 @@
 from __future__ import annotations
 
 """
-Chunked transcription for Salute GigaAM (no pyannote needed).
+VAD-only chunked transcription for Salute GigaAM.
 
-- Cuts long audio into short chunks (by energy/silence), with overlap.
-- Feeds chunks sequentially to model.transcribe.
-- Deduplicates boundary repeats.
-- Works on single files, dirs, or JSON/JSONL manifests.
- - Outputs JSON array of speech segments with file name only, formatted
-   ``start``/``end`` times (MM:SS) and punctuated ``text``.
-- Optional: write segments as JSONL via ``--write_segments``.
-
-Example:
-  python inference_gigaam_chunked.py Ilya_1_h.wav out/transcript.json \
-    --model v2_rnnt --lang ru --chunk_sec 22 --overlap_sec 1.5 \
-    --silence_peak_ratio 0.002 --write_segments out/segments.jsonl --debug
-    # optionally add: --vad_silero --vad_pad_ms 200 --silero_model_dir /path/to/silero-vad
+— Только VAD (Silero). Никакой энергетики. Никаких "подрезок" длинных VAD-сегментов.
+— Можно паковать несколько VAD-сегментов в бины (~TARGET_SPEECH_SEC) БЕЗ деления самих сегментов.
+— Работает по одиночным файлам, директориям, JSON/JSONL манифестам.
 """
 
-import argparse
-import json
-import math
-import os
-import sys
-import gc
-import time
-import tempfile
-import subprocess
-import shutil
-import io
+# ================================ ГЛОБАЛЬНЫЕ НАСТРОЙКИ ================================
+# ВХОД/ВЫХОД
+INPUT: str = "1-ilya626_0.wav"                     # Путь к аудио/директории/JSON/JSONL
+OUTPUT: str = "out/transcript.json"             # Куда писать основной JSON результат
+OUTPUT_FORMAT: str = "json"                     # "json" или "txt"
+OUTPUT_REPORT: str = "out/transcript_results.txt"   # Текстовый отчёт, если OUTPUT_FORMAT="txt"
+WRITE_SEGMENTS: str = "out/segments.jsonl"          # JSONL сегменты ("" чтобы не писать)
+
+# МОДЕЛЬ/ЯЗЫК
+MODEL_NAME: str = "v2_rnnt"                     # Модель GigaAM
+LANG: str = "ru"                                # Жёстко "ru" для проекта
+
+# VAD (Silero)
+SILERO_THRESHOLD: float = 0.5                  # Порог VAD
+SILERO_MIN_SPEECH_MS: int = 100                 # Мин. длительность речи, мс
+SILERO_MIN_SILENCE_MS: int = 200                # Мин. пауза между речью, мс
+SILERO_SPEECH_PAD_MS: int = 100                  # Паддинг вокруг речи, мс
+SILERO_CUDA: bool = True                        # Гонять Silero на CUDA (если есть)
+SILERO_MODEL_DIR: str = ""                      # Кастомная директория модели (опц.)
+
+# Постобработка VAD
+PAD_CONTEXT_MS: int = 50                         # Паддинг к каждому VAD сегменту, мс
+MERGE_CLOSE_SEGS: bool = True                  # Сливать сегменты, если пауза < MIN_GAP_SEC
+MIN_GAP_SEC: float = 0.1                        # Порог для слияния соседних сегментов, сек
+
+# УПАКОВКА В БИНЫ (БЕЗ РЕЗКИ СЕГМЕНТОВ!)
+VAD_PACK_BINS: bool = True                     # Включить упаковку в ~TARGET_SPEECH_SEC
+TARGET_SPEECH_SEC: float = 20.0                 # Целевая "речевая" длина бина, сек
+VAD_MAX_OVERSHOOT: float = 1.0                  # Допустимый переразмер бина, сек
+VAD_MAX_SILENCE_WITHIN: float = 0.75             # Макс. пауза внутри одного бина, сек
+
+# ДЕДУП/ФИЛЬТРАЦИЯ ТЕКСТА
+KEEP_ALL: bool = True                           # True: ничего не фильтровать
+DEDUP_TAIL_CHARS: int = 80                      # Если KEEP_ALL=False: хвост для дедупа, симв.
+MIN_DEDUP_OVERLAP: int = 16                     # Мин. перекрытие токенов для дедупа
+MIN_WPS: float = 1.0                            # Мин. слов/сек (для фильтра), если KEEP_ALL=False
+MIN_CPS: float = 3.0                            # Мин. символов/сек (для фильтра), если KEEP_ALL=False
+
+# ПРОЧЕЕ
+PUNCT_RU: bool = True                           # Пунктуация RUPunct
+BATCH_SIZE: int = 16                            # Батч по файлам (I/O-группировка)
+SAMPLE: int = 0                                 # Взять N файлов из манифеста (0 = все)
+USE_TEMPFILE: bool = False                      # Писать временные WAV вместо буфера
+DEBUG: bool = True                             # Отладочные принты
+# =====================================================================================
+
+import json, os, sys, gc, io, tempfile
 from pathlib import Path
-from typing import List, Tuple, Optional
-from dataclasses import dataclass, field
+from typing import List, Optional
+from dataclasses import dataclass
 
 import numpy as np
 import soundfile as sf
-from vad_module import VADProcessor
-from chunking_module import ChunkingProcessor
 
 try:
     import torch
@@ -50,109 +74,80 @@ except Exception as e:
     gigaam = None  # type: ignore
     _IMPORT_ERR = e
 
-# Optional RUPunct integration for inline punctuation of segments
-_HAVE_TRANSFORMERS = False
+# Optional RUPunct
+_HAVE_RUPUNCT = False
 try:
-    from transformers import pipeline as _hf_pipeline, AutoTokenizer as _AutoTokenizer  # type: ignore
-    _HAVE_TRANSFORMERS = True
-except Exception:
-    _HAVE_TRANSFORMERS = False
+    import rupunct_apply as rp  # build_punct_pipeline / punctuate_text
+    _HAVE_RUPUNCT = True
+except Exception as _RUPUNCT_IMPORT_ERR:
+    rp = None
+    _HAVE_RUPUNCT = False
 
-def _build_rupunct_pipeline(model_id: str = "RUPunct/RUPunct_big"):
-    """Create a HuggingFace pipeline for Russian punctuation restoration."""
-    if not _HAVE_TRANSFORMERS:
-        raise RuntimeError("transformers not available for RUPunct")
-    tk = _AutoTokenizer.from_pretrained(model_id, strip_accents=False, add_prefix_space=True)
-    clf = _hf_pipeline("ner", model=model_id, tokenizer=tk, aggregation_strategy="first")
-    return clf
+# Наш VAD
+from vad_module import VADProcessor
 
-def _rupunct_process_token(token: str, label: str) -> str:
-    """Apply punctuation/casing transformation to a single token."""
-    # Mirror mapping from rupunct_apply.py
-    mapping = {
-        "LOWER_O": "",
-        "LOWER_PERIOD": ".",
-        "LOWER_COMMA": ",",
-        "LOWER_QUESTION": "?",
-        "LOWER_TIRE": " —",
-        "LOWER_DVOETOCHIE": ":",
-        "LOWER_VOSKL": "!",
-        "LOWER_PERIODCOMMA": ";",
-        "LOWER_DEFIS": "-",
-        "LOWER_MNOGOTOCHIE": "...",
-        "LOWER_QUESTIONVOSKL": "?!",
-    }
-    upper_map = {
-        "UPPER_O": (True, ""),
-        "UPPER_PERIOD": (True, "."),
-        "UPPER_COMMA": (True, ","),
-        "UPPER_QUESTION": (True, "?"),
-        "UPPER_TIRE": (True, " —"),
-        "UPPER_DVOETOCHIE": (True, ":"),
-        "UPPER_VOSKL": (True, "!"),
-        "UPPER_PERIODCOMMA": (True, ";"),
-        "UPPER_DEFIS": (True, "-"),
-        "UPPER_MNOGOTOCHIE": (True, "..."),
-        "UPPER_QUESTIONVOSKL": (True, "?!"),
-    }
-    upper_total_map = {
-        "UPPER_TOTAL_O": (str.upper, ""),
-        "UPPER_TOTAL_PERIOD": (str.upper, "."),
-        "UPPER_TOTAL_COMMA": (str.upper, ","),
-        "UPPER_TOTAL_QUESTION": (str.upper, "?"),
-        "UPPER_TOTAL_TIRE": (str.upper, " —"),
-        "UPPER_TOTAL_DVOETOCHIE": (str.upper, ":"),
-        "UPPER_TOTAL_VOSKL": (str.upper, "!"),
-        "UPPER_TOTAL_PERIODCOMMA": (str.upper, ";"),
-        "UPPER_TOTAL_DEFIS": (str.upper, "-"),
-        "UPPER_TOTAL_MNOGOTOCHIE": (str.upper, "..."),
-        "UPPER_TOTAL_QUESTIONVOSKL": (str.upper, "?!"),
-    }
-    if label in mapping:
-        return token + mapping[label]
-    if label in upper_map:
-        cap, p = upper_map[label]
-        return token.capitalize() + p
-    if label in upper_total_map:
-        fn, p = upper_total_map[label]
-        return fn(token) + p
-    return token
+# Для улучшенного ресэмплинга
+try:
+    from scipy.signal import resample
+except ImportError:
+    resample = None
 
-def _rupunct_fix_spaces(text: str) -> str:
-    """Normalize whitespace around punctuation marks."""
-    import re as _re
-    rules = [
-        (_re.compile(r"\s+([,.;:!?—])"), r"\1"),
-        (_re.compile(r"\s+—\s*"), " — "),
-        (_re.compile(r"\s{2,}"), " "),
-    ]
-    out = text.strip()
-    for rx, rep in rules:
-        out = rx.sub(rep, out)
-    return out.strip()
+# ------------------------- Утилиты & окружение -------------------------
 
-def _rupunct_text(clf, text: str) -> str:
-    """Run RUPunct on ``text`` using ``clf`` and return punctuated string."""
-    if not text or not text.strip():
-        return text
-    preds = clf(text)
-    parts = []
-    for it in preds:
-        token = (it.get("word") or "").strip()
-        label = it.get("entity_group") or "LOWER_O"
-        parts.append(_rupunct_process_token(token, label))
-    return _rupunct_fix_spaces(" ".join(parts))
+def configure_local_caches() -> Path:
+    repo_root = Path(__file__).resolve().parent
+    os.environ.setdefault("TORCH_HOME", str(repo_root / ".torch"))
+    tmp = repo_root / ".tmp"
+    for var in ("TMPDIR", "TMP", "TEMP"):
+        os.environ.setdefault(var, str(tmp))
+    Path(os.environ["TORCH_HOME"]).mkdir(parents=True, exist_ok=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    return repo_root
 
+def _format_ts(sec: float) -> str:
+    if sec < 0:
+        sec = 0.0
+    ms = int(round(sec * 1000))
+    h = ms // 3_600_000
+    ms %= 3_600_000
+    m = ms // 60_000
+    ms %= 60_000
+    s = ms // 1000
+    ms %= 1000
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
-# ------------------------- Utilities & Env -------------------------
+def _read_wav_16k_mono(path: Path, target_sr: int = 16000) -> tuple[np.ndarray, int]:
+    try:
+        data, sr = sf.read(str(path), always_2d=False)
+    except Exception as e:
+        print(f"[ERROR] Cannot read {path}: {e}")
+        return np.array([]), target_sr
+    if not np.issubdtype(data.dtype, np.floating):
+        data = data.astype(np.float32)
+    else:
+        data = data.astype(np.float32, copy=False)
+    if data.ndim == 2:
+        data = data.mean(axis=1, dtype=np.float32)
+    elif data.ndim > 2:
+        data = data.reshape(data.shape[0], -1).mean(axis=1).astype(np.float32)
+    if sr != target_sr:
+        if resample is not None:
+            # Используем scipy для лучшего ресэмплинга
+            data = resample(data, int(len(data) * target_sr / sr))
+        else:
+            # Fallback на интерполяцию
+            n_in = data.shape[0]
+            ratio = float(target_sr) / float(sr)
+            n_out = max(1, int(round(n_in * ratio)))
+            x_in = np.linspace(0.0, n_in - 1.0, num=n_in, endpoint=True, dtype=np.float64)
+            x_out = np.linspace(0.0, n_in - 1.0, num=n_out, endpoint=True, dtype=np.float64)
+            data = np.interp(x_out, x_in, data.astype(np.float64, copy=False)).astype(np.float32)
+        sr = target_sr
+    if not np.isfinite(data).all():
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return data, sr
 
 def _safe_transcribe(model, source, lang: Optional[str] = None):
-    """Safely call model.transcribe with language if supported.
-
-    - Detects if the callable accepts a 'language' or 'lang' kwarg.
-    - Falls back to calling without language if not supported.
-    - 'source' can be a path string or a file-like buffer depending on the model.
-    """
     fn = getattr(model, "transcribe", None)
     if fn is None:
         raise AttributeError("Model has no 'transcribe' method")
@@ -167,586 +162,256 @@ def _safe_transcribe(model, source, lang: Optional[str] = None):
             elif "lang" in params:
                 kwargs["lang"] = lang
         except Exception:
-            # If we can't introspect, try without passing language
             kwargs = {}
     return fn(source, **kwargs)
 
-def configure_local_caches() -> Path:
-    """Configure cache directories for torch and temporary files."""
-    repo_root = Path(__file__).resolve().parent
-    os.environ.setdefault("TORCH_HOME", str(repo_root / ".torch"))
-    tmp = repo_root / ".tmp"
-    for var in ("TMPDIR", "TMP", "TEMP"):
-        os.environ.setdefault(var, str(tmp))
-    Path(os.environ["TORCH_HOME"]).mkdir(parents=True, exist_ok=True)
-    tmp.mkdir(parents=True, exist_ok=True)
-    return repo_root
-
-
-def require_cuda():
-    """Raise an error if CUDA is not available."""
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required. CPU inference is disabled.")
-
-
-def vram_report(tag: str) -> None:
-    """Print a brief GPU memory usage report tagged with ``tag``."""
-    try:
-        dev = torch.cuda.current_device()
-        total = torch.cuda.get_device_properties(dev).total_memory
-        free, _ = torch.cuda.mem_get_info()
-        alloc = torch.cuda.memory_allocated(dev)
-        reserv = torch.cuda.memory_reserved(dev)
-        gb = 1024 ** 3
-        print(f"[VRAM:{tag}] alloc={alloc/gb:.2f}G reserved={reserv/gb:.2f}G free={free/gb:.2f}G total={total/gb:.2f}G")
-    except Exception:
-        pass
-
-
-def acquire_gpu_lock(lock_path: Path, timeout_s: int = 120) -> tuple[bool, int]:
-    """Attempt to create a file lock to coordinate GPU usage."""
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    pid = os.getpid()
-    start = time.time()
-    while time.time() - start < timeout_s:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(str(pid))
-            print(f"[LOCK] Acquired GPU lock at {lock_path}")
-            return True, pid
-        except FileExistsError:
-            try:
-                existing_pid = int(lock_path.read_text(encoding="utf-8").strip())
-                try:
-                    os.kill(existing_pid, 0)
-                except OSError:
-                    lock_path.unlink(missing_ok=True)
-                    continue
-            except Exception:
-                pass
-            time.sleep(1)
-        except Exception:
-            try:
-                existing_pid = int(lock_path.read_text(encoding="utf-8").strip())
-                try:
-                    os.kill(existing_pid, 0)
-                except OSError:
-                    lock_path.unlink(missing_ok=True)
-                    continue
-            except Exception:
-                pass
-            time.sleep(1)
-    return False, pid
-
-
-def release_gpu_lock(lock_path: Path, owner_pid: int) -> None:
-    """Release a file lock created with :func:`acquire_gpu_lock`."""
-    try:
-        if lock_path.exists():
-            try:
-                content = lock_path.read_text(encoding="utf-8").strip()
-            except Exception:
-                content = ""
-            if content == str(owner_pid):
-                lock_path.unlink(missing_ok=True)
-                print(f"[LOCK] Released GPU lock at {lock_path}")
-    except Exception:
-        pass
-
-
-def _format_ts(sec: float) -> str:
-    """Format seconds as ``HH:MM:SS.mmm``."""
-    if sec < 0:
-        sec = 0.0
-    ms = int(round(sec * 1000))
-    h = ms // 3_600_000
-    ms %= 3_600_000
-    m = ms // 60_000
-    ms %= 60_000
-    s = ms // 1000
-    ms %= 1000
-    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-
-def _format_mmss(sec: float) -> str:
-    """Format seconds into ``MM:SS`` (or ``HH:MM:SS`` for long audio)."""
-    if sec < 0:
-        sec = 0.0
-    h = int(sec // 3600)
-    sec -= h * 3600
-    m = int(sec // 60)
-    s = int(sec - m * 60)
-    if h:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-
 def _is_dense(text: str, dur: float, min_wps: float = 1.0, min_cps: float = 3.0) -> bool:
-    """Heuristic to skip segments with too little text for their duration."""
+    if not text:
+        return False
     wps = len(text.split()) / max(dur, 1e-9)
     cps = len(text) / max(dur, 1e-9)
     return (wps >= min_wps) or (cps >= min_cps)
 
 
-def merge_segments(segs: List[dict], max_gap: float = 0.5) -> List[dict]:
-    """Merge adjacent segments when the gap between them is below ``max_gap`` seconds.
-
-    Parameters
-    ----------
-    segs:
-        List of segment dictionaries ``{"start": float, "end": float, "text": str}``
-        sorted by start time.
-    max_gap:
-        Maximum allowed silence between neighbouring segments to merge them.
-
-    Returns
-    -------
-    List[dict]
-        New list of merged segments.
-    """
-    if not segs:
-        return []
-    merged: List[dict] = [dict(segs[0])]
-    for cur in segs[1:]:
-        prev = merged[-1]
-        if cur["start"] - prev["end"] < max_gap:
-            prev["end"] = cur["end"]
-            prev["text"] = (prev["text"] + " " + cur["text"]).strip()
-        else:
-            merged.append(dict(cur))
-    return merged
-
-
-# ------------------------- Audio I/O helpers -------------------------
-
-def _get_duration_sec(path: Path) -> Optional[float]:
-    """Return audio duration in seconds using ``soundfile`` metadata."""
-    try:
-        info = sf.info(str(path))
-        if info.samplerate and info.frames:
-            return float(info.frames) / float(info.samplerate)
-    except Exception:
-        pass
-    return None
-
-
-def _preconvert_if_needed(path: Path, repo_root: Path, force: bool = False) -> Path:
-    """Ensure mono 16k PCM16 WAV using ffmpeg; convert MP3/FLAC/etc. or mismatched WAV."""
-    ext = path.suffix.lower()
-    needs = force or ext in {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wma", ".mp4", ".flac"}
-    if not needs and ext == ".wav":
-        try:
-            info = sf.info(str(path))
-            subtype = getattr(info, "subtype", "") or ""
-            if info.channels != 1 or info.samplerate != 16000 or "PCM_16" not in subtype:
-                needs = True
-        except Exception:
-            needs = True
-
-    if not needs:
-        return path
-
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        print("[preconvert] ffmpeg not found, proceeding without conversion")
-        # fallback: try to write as-is; model may still cope
-        return path
-
-    out_dir = repo_root / ".tmp" / "gigaam_pre"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{path.stem}_16k_mono.wav"
-
-    cmd = [
-        ffmpeg, "-y", "-i", str(path),
-        "-ac", "1", "-ar", "16000", "-vn", "-acodec", "pcm_s16le",
-        str(out_path),
-    ]
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return out_path
-    except Exception as e:
-        print(f"[preconvert] Conversion skipped for {path}: {e}")
-        return path
-
-
-# ------------------------- Chunking logic (no VAD deps) -------------------------
+# ------------------------- VAD → чанки (без резки!) -------------------------
 
 @dataclass
 class SileroParams:
-    threshold: float = 0.65
-    min_speech_ms: int = 200
-    min_silence_ms: int = 250
-    speech_pad_ms: int = 35
-    use_cuda: bool = False
-    model_dir: Optional[str] = None
-
-
-@dataclass
-class ChunkingParams:
-    target_speech_sec: float = 22.0
-    cut_search_sec: float = 2.0
-    frame_ms: float = 20.0
-    silence_abs: float = 0.0
-    silence_peak_ratio: float = 0.002
-    adaptive: bool = True
-    pad_context_ms: int = 0
-    min_gap_sec: float = 0.3
-    merge_close_segs: bool = False
-
+    threshold: float
+    min_speech_ms: int
+    min_silence_ms: int
+    speech_pad_ms: int
+    use_cuda: bool
+    model_dir: Optional[str]
 
 @dataclass
-class PackingParams:
-    max_overshoot_sec: float = 0.0
-    max_silence_within_sec: float = 1.2
-    min_bin_speech_sec: float = 0.0
-
+class VadParams:
+    target_speech_sec: float
+    max_overshoot_sec: float
+    max_silence_within_sec: float
+    pad_context_ms: int
+    min_gap_sec: float
+    merge_close_segs: bool
+    pack_bins: bool
 
 @dataclass
 class VadConfig:
-    silero: SileroParams = field(default_factory=SileroParams)
-    chunk: ChunkingParams = field(default_factory=ChunkingParams)
-    pack: PackingParams = field(default_factory=PackingParams)
+    silero: SileroParams
+    params: VadParams
 
+def _merge_close(segs: list[tuple[float, float]], min_gap: float) -> list[tuple[float, float]]:
+    if not segs:
+        return []
+    segs = sorted(segs)
+    out = [list(segs[0])]
+    for s, e in segs[1:]:
+        if s - out[-1][1] < min_gap:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return [(float(s), float(e)) for s, e in out]
 
 def slice_with_silero_vad(
     sr: int,
     audio: np.ndarray,
     vad_processor: VADProcessor,
-    chunk_cfg: ChunkingParams,
-    pack_cfg: PackingParams,
+    cfg: VadParams,
 ) -> tuple[list[tuple[int, int]], list[tuple[float, float]]]:
-    """Compute chunks via Silero VAD and pack them into ≈target_speech_sec bins."""
+    """
+    Только VAD. Никаких разрезаний по энергии.
+    Если pack_bins=False -> по одному чанку на каждый VAD-сегмент.
+    Если pack_bins=True  -> собираем несколько VAD-сегментов в бины ~target (не делим сегменты).
+    """
+    # Базовые VAD-сегменты
+    segs = list(vad_processor.process(audio, sr))  # [(s,e)] в секундах
+    total_dur = len(audio) / sr
 
-    segs = vad_processor.process(audio, sr)
+    # Паддинг
+    if cfg.pad_context_ms > 0 and segs:
+        pad = cfg.pad_context_ms / 1000.0
+        segs = [(max(0.0, s - pad), min(total_dur, e + pad)) for s, e in segs]
 
-    cp_split = ChunkingProcessor(
-        chunk_sec=chunk_cfg.target_speech_sec,
-        overlap_sec=0.0,
-        search_silence_sec=chunk_cfg.cut_search_sec,
-        silence_abs=chunk_cfg.silence_abs,
-        silence_peak_ratio=chunk_cfg.silence_peak_ratio,
-        frame_ms=chunk_cfg.frame_ms,
-        adaptive=chunk_cfg.adaptive,
-    )
+    # Слияние близких
+    if cfg.merge_close_segs:
+        segs = _merge_close(segs, cfg.min_gap_sec)
 
-    refined: list[tuple[float, float]] = []
-    for s, e in segs:
-        if e - s <= chunk_cfg.target_speech_sec:
-            refined.append((s, e))
-            continue
-        seg_audio = audio[int(round(s * sr)): int(round(e * sr))]
-        sub_chunks = cp_split.process(seg_audio, sr)
-        for ss, ee in sub_chunks:
-            start_t = s + ss / sr
-            end_t = s + ee / sr
-            refined.append((start_t, min(end_t, e)))
-    segs = refined
+    speech_secs = list(segs)  # для отчётов
 
-    if chunk_cfg.pad_context_ms > 0:
-        pad = chunk_cfg.pad_context_ms / 1000.0
-        total_dur = len(audio) / sr
-        padded: list[tuple[float, float]] = []
+    # Без упаковки: один чанк = один VAD-сегмент
+    if not cfg.pack_bins:
+        chunks = []
         for s, e in segs:
-            s = max(0.0, s - pad)
-            e = min(total_dur, e + pad)
-            padded.append((s, e))
-        segs = padded
+            ss = max(0, int(round(s * sr)))
+            ee = max(ss + 1, int(round(e * sr)))
+            chunks.append((ss, ee))
+        return chunks, speech_secs
 
-    if chunk_cfg.merge_close_segs and segs:
-        merged: list[tuple[float, float]] = [segs[0]]
-        for s, e in segs[1:]:
-            ps, pe = merged[-1]
-            if s - pe < chunk_cfg.min_gap_sec:
-                merged[-1] = (ps, e)
-            else:
-                merged.append((s, e))
-        segs = merged
-
+    # Упаковка в бины по сумме речи (без разделения сегментов)
     bins: list[list[tuple[float, float]]] = []
-    cur_bin: list[tuple[float, float]] = []
+    cur: list[tuple[float, float]] = []
     cur_speech = 0.0
     last_end = None
+
     for s, e in segs:
-        seg_duration = e - s
-        if cur_bin:
+        seg_d = e - s
+
+        # если текущий бином пуст и один сегмент сам по себе длиннее таргета —
+        # кладём его как отдельный бином (НЕ режем)
+        if not cur and seg_d > (cfg.target_speech_sec + cfg.max_overshoot_sec):
+            bins.append([(s, e)])
+            last_end = e
+            continue
+
+        if cur:
             gap = s - (last_end if last_end is not None else s)
-            if gap > pack_cfg.max_silence_within_sec or (
-                (cur_speech + seg_duration) > (chunk_cfg.target_speech_sec + pack_cfg.max_overshoot_sec)
-            ):
-                bins.append(cur_bin)
-                cur_bin = []
+            need_close = (gap > cfg.max_silence_within_sec) or (
+                (cur_speech + seg_d) > (cfg.target_speech_sec + cfg.max_overshoot_sec)
+            )
+            if need_close:
+                bins.append(cur)
+                cur = []
                 cur_speech = 0.0
-        cur_bin.append((s, e))
-        cur_speech += seg_duration
+
+        cur.append((s, e))
+        cur_speech += seg_d
         last_end = e
-    if cur_bin:
-        bins.append(cur_bin)
 
-    if pack_cfg.min_bin_speech_sec > 0:
-        for b in bins[:-1]:
-            speech = sum(e - s for s, e in b)
-            if speech < pack_cfg.min_bin_speech_sec:
-                raise ValueError(
-                    f"Bin speech {speech:.2f}s shorter than {pack_cfg.min_bin_speech_sec}s"
-                )
+    if cur:
+        bins.append(cur)
 
-    out: list[tuple[int, int]] = []
-    for bin_segs in bins:
-        start = bin_segs[0][0]
-        end = bin_segs[-1][1]
+    # Превращаем каждый бином в один непрерывный чанк по границам
+    chunks: list[tuple[int, int]] = []
+    for b in bins:
+        start = b[0][0]
+        end = b[-1][1]
         ss = max(0, int(round(start * sr)))
         ee = max(ss + 1, int(round(end * sr)))
-        out.append((ss, ee))
-    return out, segs
+        chunks.append((ss, ee))
+
+    return chunks, speech_secs
 
 
-def _dedup_suffix_prefix(
-    prev_tail: str,
-    new_text: str,
-    min_overlap: int = 16,
-    similarity_threshold: float = 0.9,
-) -> str:
-    """Remove repeated prefix of ``new_text`` if it duplicates suffix of ``prev_tail``.
-
-    The comparison is performed on word tokens after Unicode normalization
-    (``NFKC``) and punctuation preprocessing so that visually similar text or
-    text with different punctuation/spacing still deduplicates correctly.
-    ``min_overlap`` denotes the minimal number of tokens that must overlap in
-    order to trigger deduplication. ``similarity_threshold`` specifies the
-    minimal ratio from :class:`difflib.SequenceMatcher` to treat two token
-    sequences as overlapping.
-    """
-
-    import re
-    import unicodedata
-    from difflib import SequenceMatcher
-
-    def _normalize_tokens(text: str) -> list[str]:
-        text = unicodedata.normalize("NFKC", text)
-        # Replace punctuation with spaces before tokenization
-        text = "".join(
-            " " if unicodedata.category(ch).startswith("P") else ch for ch in text
-        )
-        return text.lower().split()
-
-    a_tokens = _normalize_tokens(prev_tail)
-    b_tokens = _normalize_tokens(new_text)
-    max_k = min(len(a_tokens), len(b_tokens), 200)  # safety limit
-    for k in range(max_k, min_overlap - 1, -1):
-        a_seq = a_tokens[-k:]
-        b_seq = b_tokens[:k]
-        ratio = SequenceMatcher(None, a_seq, b_seq).ratio()
-        if ratio >= similarity_threshold:
-            # Determine character index in original new_text to cut from
-            norm_new = unicodedata.normalize("NFKC", new_text)
-            word_matches = list(re.finditer(r"\w+", norm_new))
-            if k > len(word_matches):
-                return ""
-            cut_norm = word_matches[k - 1].end()
-            # Skip any trailing punctuation or spaces
-            while cut_norm < len(norm_new) and not norm_new[cut_norm].isalnum():
-                cut_norm += 1
-            # Map normalized index back to original text index
-            idx_map: list[int] = []
-            for i, ch in enumerate(new_text):
-                norm_ch = unicodedata.normalize("NFKC", ch)
-                idx_map.extend([i] * len(norm_ch))
-            if cut_norm >= len(idx_map):
-                return ""
-            cut_orig = idx_map[cut_norm]
-            while cut_orig < len(new_text) and not new_text[cut_orig].isalnum():
-                cut_orig += 1
-            return new_text[cut_orig:]
-    return new_text
-
-
-# ------------------------- Main transcribe loop -------------------------
+# ------------------------- Основной цикл транскриба -------------------------
 
 def transcribe_file_sequential(
     model,
     path: Path,
     repo_root: Path,
     lang: Optional[str],
-    chunk_sec: float,
-    overlap_sec: float,
-    search_silence_sec: float,
-    vad_cfg: VadConfig | None,
+    vad_cfg: VadConfig,
     dedup_tail_chars: int,
     min_dedup_overlap: int,
     debug: bool,
-    use_vad_silero: bool = False,
     use_tempfile: bool = False,
     min_wps: float = 1.0,
     min_cps: float = 3.0,
+    keep_all: bool = True,
 ) -> tuple[str, list[dict], list[str]]:
-    """Transcribe ``path`` sequentially and return full text and segment info."""
-    # Hardcode Russian language per project requirements
-    lang = "ru"
-    src = _preconvert_if_needed(path, repo_root, force=False)
-    audio, sr = sf.read(str(src))
-    if sr != 16000 or audio.ndim != 1:
-        print(f"[audio] expected 16000Hz mono, got sr={sr}, ndim={audio.ndim}")
-        return "", [], []
-    n = len(audio)
-    if n == 0:
+
+    # Язык жёстко
+    lang = LANG or "ru"
+
+    # WAV → mono 16k
+    audio, sr = _read_wav_16k_mono(path, target_sr=16000)
+    if len(audio) == 0:
         return "", [], []
 
-    vad_cfg = vad_cfg or VadConfig()
+    # VAD → чанки
+    vad_processor = VADProcessor(
+        threshold=vad_cfg.silero.threshold,
+        min_speech_ms=vad_cfg.silero.min_speech_ms,
+        min_silence_ms=vad_cfg.silero.min_silence_ms,
+        speech_pad_ms=vad_cfg.silero.speech_pad_ms,
+        max_speech_duration_s=3600.0,  # Большое значение, чтобы не резать сегменты
+        use_cuda=(vad_cfg.silero.use_cuda and torch.cuda.is_available()),
+        model_dir=vad_cfg.silero.model_dir,
+    )
+    chunks, speech_secs = slice_with_silero_vad(sr, audio, vad_processor, vad_cfg.params)
 
-    # Prefer VAD-based chunking when requested
-    chunks = None
-    speech_secs: list[tuple[float, float]] | None = None
-    if use_vad_silero:
-        try:
-            vad_processor = VADProcessor(
-                threshold=vad_cfg.silero.threshold,
-                min_speech_ms=vad_cfg.silero.min_speech_ms,
-                min_silence_ms=vad_cfg.silero.min_silence_ms,
-                speech_pad_ms=vad_cfg.silero.speech_pad_ms,
-                max_speech_duration_s=vad_cfg.chunk.target_speech_sec,
-                use_cuda=vad_cfg.silero.use_cuda,
-                model_dir=vad_cfg.silero.model_dir,
-            )
-            chunks, speech_secs = slice_with_silero_vad(
-                sr,
-                audio,
-                vad_processor,
-                vad_cfg.chunk,
-                vad_cfg.pack,
-            )
-        except Exception as e:
-            print(f"[VAD][Silero] failed ({e}); falling back to energy-based slicing.")
-
-    if chunks is None:
-        # If VAD was requested but failed, honor target_speech_sec as time target
-        time_target = float(vad_cfg.chunk.target_speech_sec) if use_vad_silero else float(chunk_sec)
-        cp = ChunkingProcessor(
-            chunk_sec=time_target,
-            overlap_sec=overlap_sec,
-            search_silence_sec=search_silence_sec,
-            silence_abs=vad_cfg.chunk.silence_abs,
-            silence_peak_ratio=vad_cfg.chunk.silence_peak_ratio,
-            frame_ms=vad_cfg.chunk.frame_ms,
-            adaptive=vad_cfg.chunk.adaptive,
-        )
-        chunks = cp.process(audio, sr)
     if debug:
-        print(
-            f"[CHUNKS] {path.name}: {len(chunks)} chunks; sr={sr}; "
-            f"chunk≈{time_target}s ovlp={overlap_sec}s search={search_silence_sec}s "
-            f"thr(abs={vad_cfg.chunk.silence_abs}, peak_ratio={vad_cfg.chunk.silence_peak_ratio})"
-        )
+        print(f"[CHUNKS] {path.name}: {len(chunks)} chunks; VAD only; pack={vad_cfg.params.pack_bins}")
+        for i, (s, e) in enumerate(speech_secs):
+            print(f"[VAD SEG {i+1}] {s:.2f}-{e:.2f} sec")
 
-    tmpdir = repo_root / ".tmp" / "gigaam_chunks_seq"
-    if use_tempfile:
-        tmpdir.mkdir(parents=True, exist_ok=True)
+    # Транскриб
+    tmpdir = repo_root / ".tmp" / "gigaam_vad_only"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+
     full_text_parts: List[str] = []
-    # Pre-fill segments with VAD times; text will be populated later
-    segments: List[dict] = [
-        {"start": s0 / sr, "end": s1 / sr, "text": ""} for s0, s1 in chunks
-    ]
+    segments: List[dict] = [{"start": s0 / sr, "end": s1 / sr, "text": ""} for s0, s1 in chunks]
 
     for i, ((s0, s1), seg) in enumerate(zip(chunks, segments)):
         seg_audio = audio[s0:s1]
-        if use_tempfile:
-            with tempfile.NamedTemporaryFile(
-                suffix=".wav", prefix=f"{path.stem}_chunk_", dir=tmpdir, delete=False
-            ) as tmpf:
-                sf.write(tmpf, seg_audio, sr, format="WAV")
-                wav_path = Path(tmpf.name)
-            try:
-                try:
-                    with torch.inference_mode():
-                        out = _safe_transcribe(model, str(wav_path), lang)
-                except TypeError:
-                    # Some backends may still raise TypeError on buffer/path specifics; try without language
-                    with torch.inference_mode():
-                        out = _safe_transcribe(model, str(wav_path), None)
-            except Exception as e:
-                print(
-                    f"[ERROR] transcribe chunk {i+1}/{len(chunks)} {path.name}: {e}"
-                )
-                try:
-                    wav_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                gc.collect()
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                continue
+
+        # Подготовка источника: всегда используем временный файл для совместимости с gigaam
+        with tempfile.NamedTemporaryFile(suffix=".wav", prefix=f"{path.stem}_chunk_", dir=tmpdir, delete=False) as tmpf:
+            sf.write(tmpf, seg_audio, sr, format="WAV")
+            wav_path = Path(tmpf.name)
+        try:
+            with torch.inference_mode():
+                out = _safe_transcribe(model, str(wav_path), lang)
+        finally:
             try:
                 wav_path.unlink(missing_ok=True)
             except Exception:
                 pass
-        else:
-            buf = io.BytesIO()
-            sf.write(buf, seg_audio, sr, format="WAV")
-            buf.seek(0)
-            try:
-                try:
-                    with torch.inference_mode():
-                        out = _safe_transcribe(model, buf, lang)
-                except TypeError:
-                    # Fallback: model does not accept file-like objects.
-                    tmpdir.mkdir(parents=True, exist_ok=True)
-                    with tempfile.NamedTemporaryFile(
-                        suffix=".wav",
-                        prefix=f"{path.stem}_chunk_",
-                        dir=tmpdir,
-                        delete=False,
-                    ) as tmpf:
-                        sf.write(tmpf, seg_audio, sr, format="WAV")
-                        tmp_path = Path(tmpf.name)
-                    try:
-                        with torch.inference_mode():
-                            out = _safe_transcribe(model, str(tmp_path), lang)
-                    finally:
-                        try:
-                            tmp_path.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-            except Exception as e:
-                print(
-                    f"[ERROR] transcribe chunk {i+1}/{len(chunks)} {path.name}: {e}"
-                )
-                gc.collect()
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
-                continue
 
-        # extract text
+        # Текст из ответа
         if isinstance(out, dict):
             text = out.get("transcription") or out.get("text") or out.get("transcript") or ""
         elif isinstance(out, list):
-            # join list of strings/dicts
-            parts = []
-            for item in out:
-                if isinstance(item, dict):
-                    parts.append(str(item.get("transcription") or item.get("text") or item.get("transcript") or ""))
-                else:
-                    parts.append(str(item))
-            text = " ".join([t for t in parts if t]).strip()
+            text = " ".join([str(it.get("transcription") or it.get("text") or it.get("transcript") or it)
+                             if isinstance(it, dict) else str(it) for it in out]).strip()
         else:
             text = out if isinstance(out, str) else str(out)
 
         if debug:
-            print(f"[CHUNK {i+1:03d}/{len(chunks)}] {path.name} "
-                  f"{_format_ts(s0/sr)}вЂ“{_format_ts(s1/sr)} txt_len={len(text)}")
+            def _fmt(x):
+                ms = int(round(x*1000)); h, ms = divmod(ms, 3_600_000); m, ms = divmod(ms, 60_000); s, ms = divmod(ms, 1000)
+                return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+            print(f"[CHUNK {i+1:03d}/{len(chunks)}] {path.name} {_fmt(s0/sr)}–{_fmt(s1/sr)} len={len(text)}")
 
-        # deduplicate overlap
-        tail = "".join(full_text_parts)[-dedup_tail_chars:] if full_text_parts else ""
-        text = _dedup_suffix_prefix(tail, text, min_overlap=min_dedup_overlap)
-        dur = (s1 - s0) / sr
-        if text and _is_dense(text, dur, min_wps=min_wps, min_cps=min_cps):
+        if keep_all:
             full_text_parts.append(text)
             seg["text"] = text
+        else:
+            # дедуп/плотность (не связаны с энергетикой)
+            tail = "".join(full_text_parts)[-dedup_tail_chars:] if full_text_parts else ""
+            from difflib import SequenceMatcher
+            import re, unicodedata
+            def _norm_tokens(t: str) -> list[str]:
+                t = unicodedata.normalize("NFKC", t)
+                t = re.sub(r'[^\w\s]', '', t)  # Удаляем пунктуацию
+                return t.lower().split()
+            a_tokens = _norm_tokens(tail)
+            b_tokens = _norm_tokens(text)
+            keep_text = text
+            max_k = min(len(a_tokens), len(b_tokens), 200)
+            dedup_found = False
+            for k in range(max_k, min_dedup_overlap - 1, -1):
+                if SequenceMatcher(None, a_tokens[-k:], b_tokens[:k]).ratio() >= 0.9:
+                    words = re.findall(r"\w+\b", text, flags=re.UNICODE)
+                    if k < len(words):
+                        idx = 0; cut_words = 0
+                        while idx < len(text) and cut_words < k:
+                            m = re.match(r"\w+\b", text[idx:], flags=re.UNICODE)
+                            if m:
+                                cut_words += 1; idx += m.end()
+                            else:
+                                idx += 1
+                        keep_text = text[idx:].lstrip()
+                    else:
+                        keep_text = ""
+                    dedup_found = True
+                    break
+            if debug and dedup_found:
+                print(f"[DEDUP] Cut overlap of {k} tokens")
+            dur = (s1 - s0) / sr
+            accept = bool(keep_text) and _is_dense(keep_text, dur, min_wps=min_wps, min_cps=min_cps)
+            if accept:
+                full_text_parts.append(keep_text)
+                seg["text"] = keep_text
 
-        # free VRAM between chunks
         gc.collect()
         try:
             torch.cuda.empty_cache()
@@ -755,273 +420,46 @@ def transcribe_file_sequential(
 
     full_text = " ".join([t for t in full_text_parts if t]).strip()
 
-    comparison_lines: list[str] = []
+    comparison_lines: List[str] = []
     if speech_secs:
         for s, e in speech_secs:
             comparison_lines.append(f"{s:.1f}-{e:.1f} Голос")
+
     return full_text, segments, comparison_lines
 
 
-# ------------------------- CLI -------------------------
-
-
-
-# ------------------------- CLI -------------------------
-
-def parse_args() -> argparse.Namespace:
-    """Build argument parser and return parsed arguments."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", type=str, help="Path to audio file/dir or JSONL/JSON manifest")
-    parser.add_argument("output", type=str, help="Path to output JSON file")
-    parser.add_argument("--model", default="v2_rnnt", help="Model type: v2_rnnt, v2_ctc, rnnt, ctc, etc.")
-    parser.add_argument("--lang", type=str, default="", help="Force language code, e.g. 'ru' or 'en'. Empty=auto")
-    parser.add_argument(
-        "--output_format",
-        choices=["json", "txt"],
-        default="json",
-        help="Output format: json (default) or txt",
-    )
-    parser.add_argument(
-        "--output_report",
-        type=str,
-        default="transcript_results.txt",
-        help="Path for text report when using --output_format txt",
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="",
-        help="Optional JSON config file with argument values",
-    )
-
-    chunk_group = parser.add_argument_group("Chunking")
-    chunk_group.add_argument("--chunk_sec", type=float, default=22.0, help="Target chunk length (seconds)")
-    chunk_group.add_argument("--overlap_sec", type=float, default=1.0, help="Overlap between chunks (seconds)")
-    chunk_group.add_argument(
-        "--search_silence_sec",
-        type=float,
-        default=0.6,
-        help="Search window near boundary to cut at silence (seconds)",
-    )
-    chunk_group.add_argument("--frame_ms", type=float, default=20.0, help="Frame size for energy envelope (ms)")
-    chunk_group.add_argument(
-        "--silence_threshold",
-        type=float,
-        default=0.0,
-        help="Absolute RMS threshold; 0=use peak ratio",
-    )
-    chunk_group.add_argument(
-        "--silence_peak_ratio",
-        type=float,
-        default=0.002,
-        help="Threshold = global_peak * ratio when absolute=0",
-    )
-    chunk_group.add_argument(
-        "--no_adaptive",
-        action="store_true",
-        help="Disable adaptive noise-floor thresholding",
-    )
-
-    vad_group = parser.add_argument_group("VAD")
-    vad_group.add_argument(
-        "--target_speech_sec",
-        type=float,
-        default=22.0,
-        help="Target speech seconds per bin (no word cuts)",
-    )
-    vad_group.add_argument(
-        "--vad_max_overshoot",
-        type=float,
-        default=1.0,
-        help="Allowable overshoot beyond target speech per bin (sec)",
-    )
-    vad_group.add_argument(
-        "--vad_max_silence_within",
-        type=float,
-        default=1.2,
-        help="Max silence gap allowed inside a bin (sec)",
-    )
-    vad_group.add_argument(
-        "--vad_min_bin_speech",
-        type=float,
-        default=10.0,
-        help=(
-            "Minimum speech per bin before it can be closed; gaps/overshoot are"
-            " ignored until this is satisfied (sec)"
-        ),
-    )
-    vad_group.add_argument(
-        "--vad_min_gap_sec",
-        type=float,
-        default=0.3,
-        help=(
-            "Minimum pause considered a boundary (sec)."
-            " Gaps smaller than this merge when --vad_merge_segs is used"
-        ),
-    )
-    vad_group.add_argument(
-        "--vad_cut_search_sec",
-        type=float,
-        default=2.0,
-        help="Search window around target for internal pause cut (sec)",
-    )
-    vad_group.add_argument(
-        "--vad_pad_ms",
-        type=int,
-        default=0,
-        help="Padding added to each VAD segment before binning (ms)",
-    )
-    vad_group.add_argument(
-        "--vad_merge_segs",
-        action="store_true",
-        help="Merge adjacent VAD segments separated by less than --vad_min_gap_sec",
-    )
-
-    silero_group = parser.add_argument_group("Silero VAD")
-    silero_group.add_argument(
-        "--vad_silero",
-        action="store_true",
-        help="Use Silero VAD (torch.hub) for chunking into ~22s speech bins",
-    )
-    silero_group.add_argument(
-        "--silero_threshold", type=float, default=0.65, help="Silero VAD threshold"
-    )
-    silero_group.add_argument(
-        "--silero_min_speech_ms",
-        type=int,
-        default=200,
-        help="Minimum speech duration in ms",
-    )
-    silero_group.add_argument(
-        "--silero_min_silence_ms",
-        type=int,
-        default=250,
-        help="Minimum silence to separate speech in ms",
-    )
-    silero_group.add_argument(
-        "--silero_speech_pad_ms",
-        type=int,
-        default=35,
-        help="Padding around detected speech in ms",
-    )
-    silero_group.add_argument(
-        "--silero_cuda",
-        action="store_true",
-        help="Run Silero VAD on CUDA if available",
-    )
-    silero_group.add_argument(
-        "--silero_model_dir",
-        type=str,
-        default="",
-        help="Directory with local Silero VAD model",
-    )
-
-    dedup_group = parser.add_argument_group("Deduplication")
-    dedup_group.add_argument(
-        "--dedup_tail_chars",
-        type=int,
-        default=80,
-        help="How many trailing chars from previous text to compare",
-    )
-    dedup_group.add_argument(
-        "--min_dedup_overlap",
-        type=int,
-        default=16,
-        help="Min token overlap to consider as duplication",
-    )
-
-    filt_group = parser.add_argument_group("Filtering")
-    filt_group.add_argument(
-        "--min_wps",
-        type=float,
-        default=1.0,
-        help="Minimum words-per-second to keep a segment",
-    )
-    filt_group.add_argument(
-        "--min_cps",
-        type=float,
-        default=3.0,
-        help="Minimum characters-per-second to keep a segment",
-    )
-
-    misc_group = parser.add_argument_group("Misc")
-    misc_group.add_argument(
-        "--batch_size", type=int, default=16, help="Files per loop batch (I/O grouping)"
-    )
-    misc_group.add_argument(
-        "--sample", type=int, default=0, help="Sample N files from manifest (0=all)"
-    )
-    misc_group.add_argument(
-        "--write_segments",
-        type=str,
-        default="",
-        help="Optional JSONL file with segment times and text (punctuated if --punct_ru)",
-    )
-    misc_group.add_argument(
-        "--punct_ru",
-        action="store_true",
-        help="Apply RUPunct to segment texts",
-    )
-    misc_group.add_argument(
-        "--no_lock", action="store_true", help="Do not acquire GPU lock"
-    )
-    misc_group.add_argument(
-        "--use_tempfile",
-        action="store_true",
-        help="Use legacy temp files for model input",
-    )
-    misc_group.add_argument("--debug", action="store_true", help="Debug prints")
-
-    args = parser.parse_args()
-    if args.config:
-        with open(args.config, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        for key, val in cfg.items():
-            if hasattr(args, key) and getattr(args, key) == parser.get_default(key):
-                setattr(args, key, val)
-    return args
-
+# ------------------------- MAIN -------------------------
 
 def main():
-    """Command-line interface for chunked GigaAM transcription."""
-    args = parse_args()
-
-
     repo_root = configure_local_caches()
-    require_cuda()
 
     if gigaam is None:
         raise SystemExit(
             "GigaAM is not installed.\n"
-            "Use Python 3.11/3.12 venv and then: pip install gigaam  (or git+https://github.com/salute-developers/GigaAM).\n"
-            f"Underlying import error: {_IMPORT_ERR}"
+            "pip install gigaam  (или git+https://github.com/salute-developers/GigaAM)\n"
+            f"Import error: {_IMPORT_ERR}"
         )
 
-    # GPU lock
-    lock_path = repo_root / ".tmp" / "gpu.lock"
-    pid = os.getpid()
-    lock_acquired = False
-    if not args.no_lock:
-        lock_acquired, pid = acquire_gpu_lock(lock_path)
-        if not lock_acquired:
-            raise RuntimeError(f"Could not acquire GPU lock at {lock_path}; another process is running")
-
-    # Load model
-    model = gigaam.load_model(args.model)
+    # Модель (GPU если есть, иначе CPU)
+    model = gigaam.load_model(MODEL_NAME)
     if hasattr(model, "eval"):
         model.eval()
     try:
-        if hasattr(model, "to"):
-            model = model.to("cuda")
-        elif hasattr(model, "cuda"):
-            model = model.cuda()
+        if torch.cuda.is_available():
+            if hasattr(model, "to"):
+                model = model.to("cuda")
+            elif hasattr(model, "cuda"):
+                model = model.cuda()
     except Exception:
         pass
 
-    # Collect input files
-    input_path = Path(args.input)
+    # Сбор входных файлов
+    input_path = Path(INPUT).resolve()
+    if not input_path.exists():
+        raise SystemExit(f"[ERROR] Input path does not exist: {INPUT}")
+
     if input_path.suffix.lower() in {".jsonl", ".json"} and input_path.is_file():
-        audio_files: list[Path] = []
+        audio_files: List[Path] = []
         if input_path.suffix.lower() == ".jsonl":
             with open(input_path, "r", encoding="utf-8-sig") as f:
                 for line in f:
@@ -1034,11 +472,17 @@ def main():
                         if not pp.is_absolute():
                             pp = (input_path.parent / pp).resolve()
                         audio_files.append(pp)
-        else:
-            with open(input_path, "r", encoding="utf-8") as f:
+        else:  # .json
+            with open(input_path, "r", encoding="utf-8-sig") as f:
                 obj = json.load(f)
             if isinstance(obj, dict):
-                audio_files = [Path(k) for k in obj.keys()]
+                for k, v in obj.items():
+                    p = k if Path(k).suffix else (v.get("audio_filepath") or v.get("audio"))
+                    if p:
+                        pp = Path(p)
+                        if not pp.is_absolute():
+                            pp = (input_path.parent / pp).resolve()
+                        audio_files.append(pp)
             elif isinstance(obj, list):
                 for it in obj:
                     if isinstance(it, dict):
@@ -1049,132 +493,128 @@ def main():
                                 pp = (input_path.parent / pp).resolve()
                             audio_files.append(pp)
     else:
-        audio_files = [input_path] if input_path.is_file() else sorted(
-            p for p in input_path.glob("**/*") if p.suffix.lower() in {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus"}
-        )
+        if input_path.is_file():
+            audio_files = [input_path]
+        else:
+            audio_files = sorted(
+                p for p in input_path.rglob("*")
+                if p.suffix.lower() in {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus"}
+            )
 
-    # Optional sampling
-    if args.sample and args.sample > 0 and len(audio_files) > args.sample:
+    if not audio_files:
+        raise SystemExit(f"[ERROR] No audio files found for INPUT={INPUT}")
+
+    if SAMPLE and SAMPLE > 0 and len(audio_files) > SAMPLE:
         import random
         random.seed(42)
         random.shuffle(audio_files)
-        audio_files = audio_files[: args.sample]
+        audio_files = audio_files[:SAMPLE]
 
-    # Transcribe
-    results: List[dict] = []  # per-segment entries with audio/start/end/text
-    report_lines: List[str] = []
-    seg_writer = None
+    # RUPunct
     rupunct = None
-    if args.write_segments:
-        Path(args.write_segments).parent.mkdir(parents=True, exist_ok=True)
-        seg_writer = open(args.write_segments, "w", encoding="utf-8")
-    if args.punct_ru:
-        try:
-            rupunct = _build_rupunct_pipeline()
-            print("[RUPunct] model loaded for inline punctuation")
-        except Exception as e:
-            print(f"[RUPunct][WARN] cannot load model: {e}")
-            rupunct = None
+    if PUNCT_RU:
+        if _HAVE_RUPUNCT:
+            try:
+                rupunct = rp.build_punct_pipeline()
+                print("[RUPunct] model loaded")
+            except Exception as e:
+                print(f"[RUPunct][WARN] cannot load model: {e}")
+                rupunct = None
+        else:
+            print(f"[RUPunct][WARN] cannot import rupunct_apply: {_RUPUNCT_IMPORT_ERR}")
 
+    # VAD конфиг (все значения — из глобалок сверху)
     vad_cfg = VadConfig(
         silero=SileroParams(
-            threshold=float(args.silero_threshold),
-            min_speech_ms=int(args.silero_min_speech_ms),
-            min_silence_ms=int(args.silero_min_silence_ms),
-            speech_pad_ms=int(args.silero_speech_pad_ms),
-            use_cuda=bool(args.silero_cuda),
-            model_dir=args.silero_model_dir or None,
+            threshold=SILERO_THRESHOLD,
+            min_speech_ms=SILERO_MIN_SPEECH_MS,
+            min_silence_ms=SILERO_MIN_SILENCE_MS,
+            speech_pad_ms=SILERO_SPEECH_PAD_MS,
+            use_cuda=SILERO_CUDA,
+            model_dir=SILERO_MODEL_DIR or None,
         ),
-        chunk=ChunkingParams(
-            target_speech_sec=float(args.target_speech_sec),
-            cut_search_sec=float(args.vad_cut_search_sec),
-            frame_ms=float(args.frame_ms),
-            silence_abs=float(args.silence_threshold),
-            silence_peak_ratio=float(args.silence_peak_ratio),
-            adaptive=not args.no_adaptive,
-            pad_context_ms=int(args.vad_pad_ms),
-            min_gap_sec=float(args.vad_min_gap_sec),
-            merge_close_segs=bool(args.vad_merge_segs),
-        ),
-        pack=PackingParams(
-            max_overshoot_sec=float(args.vad_max_overshoot),
-            max_silence_within_sec=float(args.vad_max_silence_within),
-            min_bin_speech_sec=float(args.vad_min_bin_speech),
+        params=VadParams(
+            target_speech_sec=TARGET_SPEECH_SEC,
+            max_overshoot_sec=VAD_MAX_OVERSHOOT,
+            max_silence_within_sec=VAD_MAX_SILENCE_WITHIN,
+            pad_context_ms=PAD_CONTEXT_MS,
+            min_gap_sec=MIN_GAP_SEC,
+            merge_close_segs=MERGE_CLOSE_SEGS,
+            pack_bins=VAD_PACK_BINS,
         ),
     )
 
-    bs = max(1, int(args.batch_size))
+    results: dict[str, str] = {}
+
+    seg_writer = None
+    if WRITE_SEGMENTS:
+        Path(WRITE_SEGMENTS).parent.mkdir(parents=True, exist_ok=True)
+        seg_writer = open(WRITE_SEGMENTS, "w", encoding="utf-8")
+
+    bs = max(1, int(BATCH_SIZE))
     try:
         for i in range(0, len(audio_files), bs):
-            batch_paths = audio_files[i: i + bs]
+            batch_paths = audio_files[i:i + bs]
             print(f"Transcribing batch {i // bs + 1} [{len(batch_paths)} files] ...")
-            for p in batch_paths:
 
+            for p in batch_paths:
+                if not p.exists():
+                    print(f"[WARN] Skipping missing file: {p}")
+                    continue
                 full_text, segments, comparison_lines = transcribe_file_sequential(
-                    model,
-                    p,
-                    repo_root,
-                    args.lang or None,
-                    args.chunk_sec,
-                    args.overlap_sec,
-                    args.search_silence_sec,
-                    vad_cfg,
-                    int(args.dedup_tail_chars),
-                    int(args.min_dedup_overlap),
-                    bool(args.debug),
-                    bool(args.vad_silero),
-                    bool(args.use_tempfile),
-                    float(args.min_wps),
-                    float(args.min_cps),
+                    model=model,
+                    path=p,
+                    repo_root=repo_root,
+                    lang=LANG,
+                    vad_cfg=vad_cfg,
+                    dedup_tail_chars=int(DEDUP_TAIL_CHARS),
+                    min_dedup_overlap=int(MIN_DEDUP_OVERLAP),
+                    debug=bool(DEBUG),
+                    use_tempfile=bool(USE_TEMPFILE),
+                    min_wps=float(MIN_WPS),
+                    min_cps=float(MIN_CPS),
+                    keep_all=bool(KEEP_ALL),
                 )
 
-                # Post-process segments: merge close gaps and apply punctuation
-                segments = merge_segments(segments, max_gap=0.5)
+                # Пунктуация по сегментам
                 segments_punct: List[dict] = []
-                for s in segments:
-                    text = s["text"]
-                    if rupunct is not None:
+                if PUNCT_RU and rupunct is not None:
+                    for s in segments:
+                        text = s["text"]
                         try:
-                            text = _rupunct_text(rupunct, text) or text
+                            text = rp.punctuate_text(rupunct, text) or text
                         except Exception:
                             pass
-                    segments_punct.append({**s, "text": text})
+                        segments_punct.append({**s, "text": text})
+                else:
+                    segments_punct = segments
 
-                # Full text is reconstructed from punctuated segments
                 full_text_punct = " ".join([seg["text"] for seg in segments_punct]).strip()
                 results[str(p)] = full_text_punct
-                all_reports[str(p)] = comparison_lines
 
                 if seg_writer and segments_punct:
                     for sp in segments_punct:
                         obj = {
-                            "audio": str(p),
+                            "audio": p.name,
                             "start": _format_ts(sp["start"]),
                             "end": _format_ts(sp["end"]),
+                            "duration": sp["end"] - sp["start"],
                             "text": sp["text"],
                         }
                         seg_writer.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            vram_report(f"batch_{i // bs + 1}")
-            gc.collect()
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
 
-        out_path = Path(args.output)
+        out_path = Path(OUTPUT)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Save main JSON output
         with out_path.open("w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
 
-        # Save text report if requested
-        if args.output_format == "txt":
-            report_path = Path(args.output_report)
+        if OUTPUT_FORMAT == "txt":
+            report_path = Path(OUTPUT_REPORT)
             report_path.parent.mkdir(parents=True, exist_ok=True)
             with report_path.open("w", encoding="utf-8") as f:
-                for line in report_lines:
-                    f.write(f"{line}\n")
+                for p, txt in results.items():
+                    f.write(f"{p}\n{txt}\n\n")
+
     finally:
         if seg_writer:
             seg_writer.close()
@@ -1184,10 +624,6 @@ def main():
         except Exception:
             pass
         gc.collect()
-        vram_report("final")
-        # release lock
-        if not args.no_lock:
-            release_gpu_lock(lock_path, pid)
 
 
 if __name__ == "__main__":

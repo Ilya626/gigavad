@@ -11,3 +11,5 @@ transcript_results.txt
 1-ilya626_0.wav
 output.json
 transcript.json
+segments.jsonl
+transcription.txt
