@@ -275,6 +275,35 @@ def _is_dense(text: str, dur: float, min_wps: float = 1.0, min_cps: float = 3.0)
     return (wps >= min_wps) or (cps >= min_cps)
 
 
+def merge_segments(segs: List[dict], max_gap: float = 0.5) -> List[dict]:
+    """Merge adjacent segments when the gap between them is below ``max_gap`` seconds.
+
+    Parameters
+    ----------
+    segs:
+        List of segment dictionaries ``{"start": float, "end": float, "text": str}``
+        sorted by start time.
+    max_gap:
+        Maximum allowed silence between neighbouring segments to merge them.
+
+    Returns
+    -------
+    List[dict]
+        New list of merged segments.
+    """
+    if not segs:
+        return []
+    merged: List[dict] = [dict(segs[0])]
+    for cur in segs[1:]:
+        prev = merged[-1]
+        if cur["start"] - prev["end"] < max_gap:
+            prev["end"] = cur["end"]
+            prev["text"] = (prev["text"] + " " + cur["text"]).strip()
+        else:
+            merged.append(dict(cur))
+    return merged
+
+
 # ------------------------- Audio I/O helpers -------------------------
 
 def _get_duration_sec(path: Path) -> Optional[float]:
@@ -599,9 +628,12 @@ def transcribe_file_sequential(
     if use_tempfile:
         tmpdir.mkdir(parents=True, exist_ok=True)
     full_text_parts: List[str] = []
-    segments: List[dict] = []
+    # Pre-fill segments with VAD times; text will be populated later
+    segments: List[dict] = [
+        {"start": s0 / sr, "end": s1 / sr, "text": ""} for s0, s1 in chunks
+    ]
 
-    for i, (s0, s1) in enumerate(chunks):
+    for i, ((s0, s1), seg) in enumerate(zip(chunks, segments)):
         seg_audio = audio[s0:s1]
         if use_tempfile:
             with tempfile.NamedTemporaryFile(
@@ -625,7 +657,6 @@ def transcribe_file_sequential(
                     wav_path.unlink(missing_ok=True)
                 except Exception:
                     pass
-                segments.append({"start": s0 / sr, "end": s1 / sr, "text": ""})
                 gc.collect()
                 try:
                     torch.cuda.empty_cache()
@@ -667,7 +698,6 @@ def transcribe_file_sequential(
                 print(
                     f"[ERROR] transcribe chunk {i+1}/{len(chunks)} {path.name}: {e}"
                 )
-                segments.append({"start": s0 / sr, "end": s1 / sr, "text": ""})
                 gc.collect()
                 try:
                     torch.cuda.empty_cache()
@@ -700,13 +730,7 @@ def transcribe_file_sequential(
         dur = (s1 - s0) / sr
         if text and _is_dense(text, dur, min_wps=min_wps, min_cps=min_cps):
             full_text_parts.append(text)
-            segments.append({
-                "start": s0 / sr,
-                "end": s1 / sr,
-                "text": text,
-            })
-        else:
-            segments.append({"start": s0 / sr, "end": s1 / sr, "text": ""})
+            seg["text"] = text
 
         # free VRAM between chunks
         gc.collect()
@@ -917,18 +941,12 @@ def parse_args() -> argparse.Namespace:
         "--write_segments",
         type=str,
         default="",
-        help="Optional JSONL file to write segments with timestamps",
-    )
-    misc_group.add_argument(
-        "--write_segments_punct",
-        type=str,
-        default="",
-        help="Optional JSONL to write segments with punctuation (text_punct)",
+        help="Optional JSONL file with segment times and text (punctuated if --punct_ru)",
     )
     misc_group.add_argument(
         "--punct_ru",
         action="store_true",
-        help="Apply RUPunct to segment texts and write text_punct",
+        help="Apply RUPunct to segment texts",
     )
     misc_group.add_argument(
         "--no_lock", action="store_true", help="Do not acquire GPU lock"
@@ -1032,15 +1050,11 @@ def main():
     results: dict[str, str] = {}
     all_reports: dict[str, list[str]] = {}
     seg_writer = None
-    seg_writer_punct = None
     rupunct = None
     if args.write_segments:
         Path(args.write_segments).parent.mkdir(parents=True, exist_ok=True)
         seg_writer = open(args.write_segments, "w", encoding="utf-8")
-    if args.write_segments_punct:
-        Path(args.write_segments_punct).parent.mkdir(parents=True, exist_ok=True)
-        seg_writer_punct = open(args.write_segments_punct, "w", encoding="utf-8")
-    if args.punct_ru and (args.write_segments_punct or args.write_segments):
+    if args.punct_ru:
         try:
             rupunct = _build_rupunct_pipeline()
             print("[RUPunct] model loaded for inline punctuation")
@@ -1082,41 +1096,49 @@ def main():
             print(f"Transcribing batch {i // bs + 1} [{len(batch_paths)} files] ...")
             for p in batch_paths:
                 full_text, segments, comparison_lines = transcribe_file_sequential(
-                    model, p, repo_root,
+                    model,
+                    p,
+                    repo_root,
                     args.lang or None,
-                    args.chunk_sec, args.overlap_sec,
+                    args.chunk_sec,
+                    args.overlap_sec,
                     args.search_silence_sec,
                     vad_cfg,
-                    int(args.dedup_tail_chars), int(args.min_dedup_overlap),
+                    int(args.dedup_tail_chars),
+                    int(args.min_dedup_overlap),
                     bool(args.debug),
                     bool(args.vad_silero),
                     bool(args.use_tempfile),
-                    float(args.min_wps), float(args.min_cps),
+                    float(args.min_wps),
+                    float(args.min_cps),
                 )
-                results[str(p)] = full_text
+
+                # Post-process segments: merge close gaps and apply punctuation
+                segments = merge_segments(segments, max_gap=0.5)
+                segments_punct: List[dict] = []
+                for s in segments:
+                    text = s["text"]
+                    if rupunct is not None:
+                        try:
+                            text = _rupunct_text(rupunct, text) or text
+                        except Exception:
+                            pass
+                    segments_punct.append({**s, "text": text})
+
+                # Full text is reconstructed from punctuated segments
+                full_text_punct = " ".join([seg["text"] for seg in segments_punct]).strip()
+                results[str(p)] = full_text_punct
                 all_reports[str(p)] = comparison_lines
-                if (seg_writer or seg_writer_punct) and segments:
-                    for s in segments:
-                        base_obj = {
+
+                if seg_writer and segments_punct:
+                    for sp in segments_punct:
+                        obj = {
                             "audio": str(p),
-                            "start": s["start"],
-                            "end": s["end"],
-                            "start_str": _format_ts(s["start"]),
-                            "end_str": _format_ts(s["end"]),
-                            "text": s["text"],
+                            "start": _format_ts(sp["start"]),
+                            "end": _format_ts(sp["end"]),
+                            "text": sp["text"],
                         }
-                        if seg_writer:
-                            seg_writer.write(json.dumps(base_obj, ensure_ascii=False) + "\n")
-                        if seg_writer_punct:
-                            obj = dict(base_obj)
-                            if rupunct is not None:
-                                try:
-                                    obj["text_punct"] = _rupunct_text(rupunct, s["text"]) or s["text"]
-                                except Exception:
-                                    obj["text_punct"] = s["text"]
-                            else:
-                                obj["text_punct"] = s["text"]
-                            seg_writer_punct.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                        seg_writer.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
             vram_report(f"batch_{i // bs + 1}")
             gc.collect()
@@ -1143,8 +1165,6 @@ def main():
     finally:
         if seg_writer:
             seg_writer.close()
-        if seg_writer_punct:
-            seg_writer_punct.close()
         try:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
