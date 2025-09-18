@@ -666,7 +666,10 @@ def main():
                     f.write(f"{p}\n{txt}\n\n")
 
         dialog_file = local_segments_dir / f"dialog_{root_path.name}.jsonl"
-        with dialog_file.open("w", encoding="utf-8") as f:
+        dialog_txt_file = local_segments_dir / f"dialog_{root_path.name}.txt"
+        with dialog_file.open("w", encoding="utf-8") as jsonl_out, dialog_txt_file.open(
+            "w", encoding="utf-8"
+        ) as txt_out:
             for seg in merged_segments:
                 obj = {
                     "audio": seg["audio"],
@@ -674,7 +677,20 @@ def main():
                     "end": _format_ts(seg["end"]),
                     "text": seg["text"],
                 }
-                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                jsonl_out.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+                audio_field = seg.get("audio") or ""
+                audio_name = os.path.basename(audio_field)
+                speaker = Path(audio_name).stem or audio_name or "audio"
+
+                text_value = seg.get("text")
+                if text_value is None:
+                    text_value = ""
+                elif not isinstance(text_value, str):
+                    text_value = str(text_value)
+
+                serialized_text = json.dumps(text_value, ensure_ascii=False)
+                txt_out.write(f"{speaker}: {serialized_text}\n")
 
     try:
         torch.cuda.synchronize(); torch.cuda.empty_cache()
