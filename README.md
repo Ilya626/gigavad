@@ -1,116 +1,76 @@
 # GigaVAD
 
-Utilities for chunked speech transcription and voice activity detection.
+Инструменты для пакетной обработки диктовок: детекция голосовой активности (VAD), упаковка сегментов и распознавание речи моделями [Salute GigaAM](https://github.com/salute-developers/GigaAM). Центральный сценарий `inference_gigaam.py` обходит каталоги с аудиофайлами, вырезает фрагменты речи с помощью Silero VAD, распознаёт их и собирает финальные диалоги.
 
-## Features
-- **VADProcessor**: wrapper around [Silero VAD](https://github.com/snakers4/silero-vad) for
-  detecting speech segments. Supports an optional ``model_dir`` parameter to
-  load pre-downloaded weights and avoid using ``torch.hub``.
-- **ChunkingProcessor**: splits long audio into manageable chunks based on
-  energy and optional overlap. Supports adaptive silence thresholds based on
-  noise-floor statistics which can be disabled with ``adaptive=False`` or the
-  ``--no_adaptive`` CLI flag.
-- **inference_gigaam.py**: command-line tool for transcribing long recordings
-  with [GigaAM](https://github.com/salute-developers/GigaAM) models. CLI options
-  are grouped (Chunking, VAD, etc.) and can be loaded from a JSON config file
-  via the `--config` flag.
-- **rupunct_apply.py**: optional script that restores Russian punctuation on
-  JSONL segment files.
+## Состав репозитория
+- **`inference_gigaam.py`** — основной конвейер обработки каталогов с записями. Управляет Silero VAD, упаковкой сегментов, вызовом GigaAM и формированием итоговых файлов (`transcript.json`, `dialog_*.jsonl`, `dialog_*.txt`).
+- **`vad_module.py`** — тонкая обёртка над Silero VAD с дополнительными опциями паддинга, фильтрации и слияния сегментов.
+- **`rupunct_apply.py`** — утилита для расстановки русской пунктуации и регистра с помощью модели [RUPunct_big](https://huggingface.co/RUPunct/RUPunct_big). Используется и как отдельный CLI, и из `inference_gigaam.py`, если доступна зависимость.
 
-## Installation
-Create a Python 3.11/3.12 virtual environment and install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-## Quick start
-Transcribe a WAV file and obtain a JSON transcript:
-
-```bash
-# direct CLI usage
-python inference_gigaam.py input.wav transcript.json \
-    --model v2_rnnt --lang ru --chunk_sec 22 --overlap_sec 1.0
-
-# or place arguments in a JSON config file
-echo '{"model": "v2_rnnt", "lang": "ru", "chunk_sec": 22, "overlap_sec": 1.0}' > cfg.json
-python inference_gigaam.py input.wav transcript.json --config cfg.json
-
-# add --vad_silero --silero_model_dir /path/to/silero-vad to use local VAD
-# use --vad_pad_ms to extend VAD segments and avoid cutting words at boundaries
-```
-
-Increasing `--vad_pad_ms` adds the specified milliseconds of context before and
-after every VAD segment prior to bin packing. This extra margin helps prevent
-words from being truncated at chunk boundaries, improving boundary safety.
-
-Use `--vad_min_bin_speech` to require a minimum amount of speech in each VAD
-bin. If a gap or duration limit would close the bin early, segments are merged
-with subsequent ones until this threshold is reached.
-
-Pass `--vad_merge_segs` to merge adjacent VAD segments separated by short
-pauses. Gaps shorter than `--vad_min_gap_sec` are joined before bin packing,
-reducing excessive fragmentation of speech.
-
-To run plain VAD and save detected segments:
-
-```bash
-python vad_example.py input.wav vad_output.txt
-```
-
-For punctuation restoration of per-segment JSONL:
-
-```bash
-python rupunct_apply.py --in segments.jsonl --out segments_punct.jsonl \
-    --merge_json transcript_punct.json
-```
-
-## Offline Silero VAD
-
-Download `model.jit` and `utils_vad.py` from the
-[snakers4/silero-vad](https://github.com/snakers4/silero-vad) repository and
-place them in a directory. Provide this directory to run VAD without relying on
-`torch.hub`:
-
-```bash
-python vad_example.py input.wav vad_output.txt --silero_model_dir /path/to/silero-vad
-python inference_gigaam.py input.wav transcript.json \
-    --model v2_rnnt --lang ru --vad_silero \
-    --silero_model_dir /path/to/silero-vad
-```
-
-## Testing
-
-The repository includes basic unit tests and example commands. Example WAV and
-reference text files (e.g. `ilya_6m_test.wav` and `vad_hand_results_6m.txt`)
-are user-provided.
-
-1. Run automated tests:
-
+## Установка
+1. Подготовьте окружение Python 3.10+.
+2. Установите зависимости:
    ```bash
-   python -m pytest tests
+   pip install -r requirements.txt
    ```
-
-2. Execute VAD on a sample file and compare against a reference:
-
+3. Библиотека `gigaam` подключается как опциональная зависимость. Если пакета нет в PyPI вашей системы, установите его напрямую из GitHub:
    ```bash
-   python vad_example.py ilya_6m_test.wav vad_output.txt --silero_model_dir /path/to/silero-vad
-   diff -y vad_output.txt vad_hand_results_6m.txt
+   pip install git+https://github.com/salute-developers/GigaAM
    ```
+4. Для офлайн-запуска Silero VAD скачайте `model.jit` и `utils_vad.py` из репозитория [snakers4/silero-vad](https://github.com/snakers4/silero-vad) и укажите путь в параметре `SILERO_MODEL_DIR`.
 
-3. Transcribe the sample file with bin packing and optional VAD:
+## Подготовка данных
+- Скрипт ожидает дерево каталогов с аудиофайлами в формате WAV/FLAC/MP3/M4A/AAC/OGG/OPUS.
+- По умолчанию корневой каталог задаётся константой `INPUT = "records"`. Поменяйте её, если исходные записи лежат в другом месте.
+- Вложенная структура каталогов сохраняется в выходных данных: для каждой подпапки создаётся собственный набор файлов результатов.
 
-   ```bash
-   python inference_gigaam.py ilya_6m_test.wav transcript.json \
-       --model v2_rnnt --lang ru --chunk_sec 22 --overlap_sec 1.0 \
-       --vad_silero --silero_model_dir /path/to/silero-vad
-   ```
+## Настройка конвейера
+Основные параметры задаются в верхней части `inference_gigaam.py`.
 
-   - `--vad_silero` toggles Silero-based VAD (omit to disable).
-   - `--chunk_sec` and `--overlap_sec` control bin packing of speech segments.
-   - PyTorch uses the GPU automatically when available.
+| Параметр | Назначение |
+| --- | --- |
+| `OUTPUT` | Путь к файлу агрегированного JSON с расшифровками (будет создан в зеркальной структуре относительно входных каталогов). |
+| `OUTPUT_FORMAT` | Если значение `"txt"`, дополнительно формируется текстовый отчёт `OUTPUT_REPORT`. |
+| `WRITE_SEGMENTS` | Базовая папка для хранения `*_segments.jsonl`, `dialog_*.jsonl` и `dialog_*.txt`. |
+| `MODEL_NAME`, `LANG` | Идентификатор модели GigaAM и язык распознавания. |
+| Блок **Silero** | Параметры VAD: порог срабатывания, минимальная длина речи, паддинг и т.д. |
+| Блок **VAD_PACK_BINS** | Управление упаковкой сегментов в бины фиксированной длины без разрезания середины фраз. |
+| `MAX_DIALOG_GAP_SEC` | Максимальная пауза между сегментами одного файла при сборке диалога. |
+| `PUNCT_RU` | Включает пунктуацию с помощью RUPunct (требуются `transformers` и модель `RUPunct_big`). |
 
-## Development
-All modules contain docstrings and are intended to be easy to extend. Run
-`python -m py_compile *.py` to validate syntax.
+При необходимости правьте и другие параметры (отбор файлов, фильтры качества текста, использование временных файлов и т.п.).
 
+## Запуск распознавания
+После настройки констант выполните из корня репозитория:
+
+```bash
+python inference_gigaam.py
+```
+
+Скрипт автоматически создаёт локальные директории `.torch` и `.tmp` для кэшей и временных файлов. Если доступен GPU, Silero и GigaAM будут использовать CUDA.
+
+## Результаты работы
+Для каждой обработанной подпапки входного каталога формируются следующие файлы (пути указаны относительно `WRITE_SEGMENTS`/`OUTPUT`):
+
+- `<subdir>/transcript.json` — агрегированный JSON вида `{ "audio.wav": "полный текст" }`.
+- `<subdir>/transcript_results.txt` — текстовый отчёт (создаётся только при `OUTPUT_FORMAT = "txt"`).
+- `<subdir>/<имя_аудио>_segments.jsonl` — построчные сегменты с таймкодами и распознанным текстом.
+- `<subdir>/dialog_<subdir>.jsonl` — объединённый диалог с таймкодами после слияния соседних реплик.
+- `<subdir>/dialog_<subdir>.txt` — "очищенная" версия диалога (по одной реплике на строку в формате `имя: "текст"`).
+
+Если активирован `PUNCT_RU` и зависимости доступны, сегменты диалога дополнительно проходят через RUPunct; ошибки загрузки модели не прерывают обработку.
+
+## Отдельная расстановка пунктуации
+Скрипт `rupunct_apply.py` можно запускать самостоятельно для уже готовых сегментов JSONL:
+
+```bash
+python rupunct_apply.py --in path/to/segments.jsonl \
+    --out path/to/segments_punct.jsonl \
+    --merge_json path/to/transcript_punct.json
+```
+
+На выходе получаются сегменты с полем `text_punct` и, при указании `--merge_json`, агрегированный JSON с восстановленной пунктуацией.
+
+## Разработка
+- Для быстрой проверки синтаксиса используйте `python -m py_compile inference_gigaam.py rupunct_apply.py`.
+- Автоматических unit-тестов в репозитории нет; проверяйте изменения на реальных данных перед выкладкой.
