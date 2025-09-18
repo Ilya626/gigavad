@@ -4,61 +4,69 @@ from __future__ import annotations
 """
 VAD-only chunked transcription for Salute GigaAM.
 
-— Только VAD (Silero). Никакой энергетики. Никаких "подрезок" длинных VAD-сегментов.
-— Можно паковать несколько VAD-сегментов в бины (~TARGET_SPEECH_SEC) БЕЗ деления самих сегментов.
-— Работает по одиночным файлам, директориям, JSON/JSONL манифестам.
+— Только VAD (Silero). 
+— Можно паковать несколько VAD-сегментов в бины (~TARGET_SPEECH_SEC).
+— Работает по директориям с аудиофайлами, создаёт segments.jsonl для каждого файла и финальный dialog.jsonl.
+— Диалог собирается без пунктуации, объединяет последовательные реплики одного файла, если пауза <= MAX_DIALOG_GAP_SEC.
+— Пунктуация применяется после объединения реплик.
 """
 
 # ================================ ГЛОБАЛЬНЫЕ НАСТРОЙКИ ================================
 # ВХОД/ВЫХОД
-INPUT: str = "1-ilya626_0.wav"                     # Путь к аудио/директории/JSON/JSONL
-OUTPUT: str = "out/transcript.json"             # Куда писать основной JSON результат
-OUTPUT_FORMAT: str = "json"                     # "json" или "txt"
-OUTPUT_REPORT: str = "out/transcript_results.txt"   # Текстовый отчёт, если OUTPUT_FORMAT="txt"
-WRITE_SEGMENTS: str = "out/segments.jsonl"          # JSONL сегменты ("" чтобы не писать)
+INPUT: str = "records"                       # Путь к папке с аудиофайлами
+OUTPUT: str = "out/transcript.json"          # Куда писать основной JSON результат
+OUTPUT_FORMAT: str = "json"                  # "json" или "txt"
+OUTPUT_REPORT: str = "out/transcript_results.txt"  # Текстовый отчёт, если OUTPUT_FORMAT="txt"
+WRITE_SEGMENTS: str = "out"                  # Папка для {имя_файла}_segments.jsonl
 
 # МОДЕЛЬ/ЯЗЫК
-MODEL_NAME: str = "v2_rnnt"                     # Модель GigaAM
-LANG: str = "ru"                                # Жёстко "ru" для проекта
+MODEL_NAME: str = "v2_rnnt"                  # Модель GigaAM
+LANG: str = "ru"                             # Жёстко "ru" для проекта
 
 # VAD (Silero)
-SILERO_THRESHOLD: float = 0.5                  # Порог VAD
-SILERO_MIN_SPEECH_MS: int = 100                 # Мин. длительность речи, мс
-SILERO_MIN_SILENCE_MS: int = 200                # Мин. пауза между речью, мс
-SILERO_SPEECH_PAD_MS: int = 100                  # Паддинг вокруг речи, мс
-SILERO_CUDA: bool = True                        # Гонять Silero на CUDA (если есть)
-SILERO_MODEL_DIR: str = ""                      # Кастомная директория модели (опц.)
+SILERO_THRESHOLD: float = 0.35                # Порог VAD
+SILERO_MIN_SPEECH_MS: int = 100              # Мин. длительность речи, мс
+SILERO_MIN_SILENCE_MS: int = 200             # Мин. пауза между речью, мс
+SILERO_SPEECH_PAD_MS: int = 100              # Паддинг вокруг речи, мс
+SILERO_CUDA: bool = True                     # Гонять Silero на CUDA (если есть)
+SILERO_MODEL_DIR: str = ""                   # Кастомная директория модели (опц.)
 
 # Постобработка VAD
-PAD_CONTEXT_MS: int = 50                         # Паддинг к каждому VAD сегменту, мс
-MERGE_CLOSE_SEGS: bool = True                  # Сливать сегменты, если пауза < MIN_GAP_SEC
-MIN_GAP_SEC: float = 0.1                        # Порог для слияния соседних сегментов, сек
+PAD_CONTEXT_MS: int = 50                     # Паддинг к каждому VAD сегменту, мс
+MERGE_CLOSE_SEGS: bool = True                # Сливать сегменты, если пауза < MIN_GAP_SEC
+MIN_GAP_SEC: float = 0.1                     # Порог для слияния соседних сегментов, сек
 
 # УПАКОВКА В БИНЫ (БЕЗ РЕЗКИ СЕГМЕНТОВ!)
-VAD_PACK_BINS: bool = True                     # Включить упаковку в ~TARGET_SPEECH_SEC
-TARGET_SPEECH_SEC: float = 20.0                 # Целевая "речевая" длина бина, сек
-VAD_MAX_OVERSHOOT: float = 1.0                  # Допустимый переразмер бина, сек
-VAD_MAX_SILENCE_WITHIN: float = 0.75             # Макс. пауза внутри одного бина, сек
+VAD_PACK_BINS: bool = True                   # Включить упаковку в ~TARGET_SPEECH_SEC
+TARGET_SPEECH_SEC: float = 15                # Целевая "речевая" длина бина, сек
+VAD_MAX_OVERSHOOT: float = 2.0               # Допустимый переразмер бина, сек
+VAD_MAX_SILENCE_WITHIN: float = 0.75         # Макс. пауза внутри одного бина, сек
+MAX_BIN_DUR_SEC: float = 20.0                # Максимальная общая длина бина, сек
+MAX_DIALOG_GAP_SEC: float = 3.0              # Макс. пауза между репликами одного файла для объединения, сек
 
 # ДЕДУП/ФИЛЬТРАЦИЯ ТЕКСТА
-KEEP_ALL: bool = True                           # True: ничего не фильтровать
-DEDUP_TAIL_CHARS: int = 80                      # Если KEEP_ALL=False: хвост для дедупа, симв.
-MIN_DEDUP_OVERLAP: int = 16                     # Мин. перекрытие токенов для дедупа
-MIN_WPS: float = 1.0                            # Мин. слов/сек (для фильтра), если KEEP_ALL=False
-MIN_CPS: float = 3.0                            # Мин. символов/сек (для фильтра), если KEEP_ALL=False
+KEEP_ALL: bool = True                        # True: ничего не фильтровать
+DEDUP_TAIL_CHARS: int = 80                   # Если KEEP_ALL=False: хвост для дедупа, симв.
+MIN_DEDUP_OVERLAP: int = 16                  # Мин. перекрытие токенов для дедупа
+MIN_WPS: float = 1.0                         # Мин. слов/сек (для фильтра), если KEEP_ALL=False
+MIN_CPS: float = 3.0                         # Мин. символов/сек (для фильтра), если KEEP_ALL=False
 
 # ПРОЧЕЕ
-PUNCT_RU: bool = True                           # Пунктуация RUPunct
-BATCH_SIZE: int = 16                            # Батч по файлам (I/O-группировка)
-SAMPLE: int = 0                                 # Взять N файлов из манифеста (0 = все)
-USE_TEMPFILE: bool = False                      # Писать временные WAV вместо буфера
-DEBUG: bool = True                             # Отладочные принты
+PUNCT_RU: bool = True                        # Пунктуация RUPunct
+BATCH_SIZE: int = 16                         # Батч по файлам (I/O-группировка)
+SAMPLE: int = 0                              # Взять N файлов из манифеста (0 = все)
+USE_TEMPFILE: bool = False                   # Писать временные WAV вместо буфера
+PARALLEL_PROCESSES: int = 0                  # Отключено: всё в одном потоке
+DEBUG: bool = True                           # Отладочные принты
 # =====================================================================================
 
 import json, os, sys, gc, io, tempfile
 from pathlib import Path
 from typing import List, Optional
 from dataclasses import dataclass
+from difflib import SequenceMatcher
+import re
+import unicodedata
 
 import numpy as np
 import soundfile as sf
@@ -132,10 +140,8 @@ def _read_wav_16k_mono(path: Path, target_sr: int = 16000) -> tuple[np.ndarray, 
         data = data.reshape(data.shape[0], -1).mean(axis=1).astype(np.float32)
     if sr != target_sr:
         if resample is not None:
-            # Используем scipy для лучшего ресэмплинга
             data = resample(data, int(len(data) * target_sr / sr))
         else:
-            # Fallback на интерполяцию
             n_in = data.shape[0]
             ratio = float(target_sr) / float(sr)
             n_out = max(1, int(round(n_in * ratio)))
@@ -193,6 +199,7 @@ class VadParams:
     min_gap_sec: float
     merge_close_segs: bool
     pack_bins: bool
+    max_bin_dur_sec: float
 
 @dataclass
 class VadConfig:
@@ -222,22 +229,36 @@ def slice_with_silero_vad(
     Если pack_bins=False -> по одному чанку на каждый VAD-сегмент.
     Если pack_bins=True  -> собираем несколько VAD-сегментов в бины ~target (не делим сегменты).
     """
-    # Базовые VAD-сегменты
     segs = list(vad_processor.process(audio, sr))  # [(s,e)] в секундах
     total_dur = len(audio) / sr
 
-    # Паддинг
+    max_chunk_sec = cfg.target_speech_sec + cfg.max_overshoot_sec  # 17 сек
+
+    # Сначала добавляем паддинг
     if cfg.pad_context_ms > 0 and segs:
         pad = cfg.pad_context_ms / 1000.0
         segs = [(max(0.0, s - pad), min(total_dur, e + pad)) for s, e in segs]
 
-    # Слияние близких
+    # Затем слияние близких
     if cfg.merge_close_segs:
         segs = _merge_close(segs, cfg.min_gap_sec)
 
+    # Теперь разбиваем длинные сегменты после слияния
+    new_segs = []
+    for s, e in segs:
+        seg_d = e - s
+        if seg_d > cfg.max_bin_dur_sec:
+            start = s
+            while start < e:
+                end = min(start + cfg.target_speech_sec, e)  # ~15 сек или остаток
+                new_segs.append((start, end))
+                start = end
+        else:
+            new_segs.append((s, e))
+    segs = new_segs
+
     speech_secs = list(segs)  # для отчётов
 
-    # Без упаковки: один чанк = один VAD-сегмент
     if not cfg.pack_bins:
         chunks = []
         for s, e in segs:
@@ -246,31 +267,35 @@ def slice_with_silero_vad(
             chunks.append((ss, ee))
         return chunks, speech_secs
 
-    # Упаковка в бины по сумме речи (без разделения сегментов)
     bins: list[list[tuple[float, float]]] = []
     cur: list[tuple[float, float]] = []
     cur_speech = 0.0
     last_end = None
+    cur_start = None
 
     for s, e in segs:
         seg_d = e - s
 
-        # если текущий бином пуст и один сегмент сам по себе длиннее таргета —
-        # кладём его как отдельный бином (НЕ режем)
-        if not cur and seg_d > (cfg.target_speech_sec + cfg.max_overshoot_sec):
+        if not cur and seg_d > max_chunk_sec:
             bins.append([(s, e)])
             last_end = e
             continue
 
         if cur:
             gap = s - (last_end if last_end is not None else s)
+            potential_end = e
+            potential_dur = potential_end - cur_start if cur_start is not None else seg_d
             need_close = (gap > cfg.max_silence_within_sec) or (
-                (cur_speech + seg_d) > (cfg.target_speech_sec + cfg.max_overshoot_sec)
-            )
+                (cur_speech + seg_d) > max_chunk_sec
+            ) or (potential_dur > cfg.max_bin_dur_sec)
             if need_close:
                 bins.append(cur)
                 cur = []
                 cur_speech = 0.0
+                cur_start = None
+
+        if not cur:
+            cur_start = s
 
         cur.append((s, e))
         cur_speech += seg_d
@@ -279,7 +304,6 @@ def slice_with_silero_vad(
     if cur:
         bins.append(cur)
 
-    # Превращаем каждый бином в один непрерывный чанк по границам
     chunks: list[tuple[int, int]] = []
     for b in bins:
         start = b[0][0]
@@ -307,7 +331,6 @@ def transcribe_file_sequential(
     min_cps: float = 3.0,
     keep_all: bool = True,
 ) -> tuple[str, list[dict], list[str]]:
-
     # Язык жёстко
     lang = LANG or "ru"
 
@@ -322,7 +345,8 @@ def transcribe_file_sequential(
         min_speech_ms=vad_cfg.silero.min_speech_ms,
         min_silence_ms=vad_cfg.silero.min_silence_ms,
         speech_pad_ms=vad_cfg.silero.speech_pad_ms,
-        max_speech_duration_s=3600.0,  # Большое значение, чтобы не резать сегменты
+        max_speech_duration_s=vad_cfg.params.target_speech_sec + vad_cfg.params.max_overshoot_sec,  # 15 + 2 = 17 сек
+        max_bin_dur_sec=vad_cfg.params.max_bin_dur_sec,  # 20 сек
         use_cuda=(vad_cfg.silero.use_cuda and torch.cuda.is_available()),
         model_dir=vad_cfg.silero.model_dir,
     )
@@ -333,13 +357,34 @@ def transcribe_file_sequential(
         for i, (s, e) in enumerate(speech_secs):
             print(f"[VAD SEG {i+1}] {s:.2f}-{e:.2f} sec")
 
+    # Финальная проверка и разбиение чанков
+    max_bin_dur_samples = int(vad_cfg.params.max_bin_dur_sec * sr)
+    new_chunks = []
+    new_segments = []
+    for s0, s1 in chunks:
+        dur_samples = s1 - s0
+        if dur_samples > max_bin_dur_samples:
+            start = s0
+            while start < s1:
+                end = min(start + max_bin_dur_samples, s1)
+                new_chunks.append((start, end))
+                new_segments.append({"start": start / sr, "end": end / sr, "text": ""})
+                start = end
+        else:
+            new_chunks.append((s0, s1))
+            new_segments.append({"start": s0 / sr, "end": s1 / sr, "text": ""})
+    chunks = new_chunks
+    segments = new_segments
+
+    if debug:
+        for i, (s0, s1) in enumerate(chunks):
+            print(f"[FINAL CHUNK {i+1}] {path.name} {_format_ts(s0/sr)}–{_format_ts(s1/sr)} dur={(s1-s0)/sr:.2f} sec")
+
     # Транскриб
     tmpdir = repo_root / ".tmp" / "gigaam_vad_only"
     tmpdir.mkdir(parents=True, exist_ok=True)
 
     full_text_parts: List[str] = []
-    segments: List[dict] = [{"start": s0 / sr, "end": s1 / sr, "text": ""} for s0, s1 in chunks]
-
     for i, ((s0, s1), seg) in enumerate(zip(chunks, segments)):
         seg_audio = audio[s0:s1]
 
@@ -366,10 +411,7 @@ def transcribe_file_sequential(
             text = out if isinstance(out, str) else str(out)
 
         if debug:
-            def _fmt(x):
-                ms = int(round(x*1000)); h, ms = divmod(ms, 3_600_000); m, ms = divmod(ms, 60_000); s, ms = divmod(ms, 1000)
-                return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-            print(f"[CHUNK {i+1:03d}/{len(chunks)}] {path.name} {_fmt(s0/sr)}–{_fmt(s1/sr)} len={len(text)}")
+            print(f"[CHUNK {i+1:03d}/{len(chunks)}] {path.name} {_format_ts(s0/sr)}–{_format_ts(s1/sr)} len={len(text)}")
 
         if keep_all:
             full_text_parts.append(text)
@@ -377,8 +419,6 @@ def transcribe_file_sequential(
         else:
             # дедуп/плотность (не связаны с энергетикой)
             tail = "".join(full_text_parts)[-dedup_tail_chars:] if full_text_parts else ""
-            from difflib import SequenceMatcher
-            import re, unicodedata
             def _norm_tokens(t: str) -> list[str]:
                 t = unicodedata.normalize("NFKC", t)
                 t = re.sub(r'[^\w\s]', '', t)  # Удаляем пунктуацию
@@ -428,19 +468,12 @@ def transcribe_file_sequential(
     return full_text, segments, comparison_lines
 
 
-# ------------------------- MAIN -------------------------
+# ------------------------- Функция для обработки одного файла -------------------------
 
-def main():
-    repo_root = configure_local_caches()
+def process_single_file(args):
+    p, repo_root, vad_cfg, lang, dedup_tail_chars, min_dedup_overlap, debug, use_tempfile, min_wps, min_cps, keep_all = args
 
-    if gigaam is None:
-        raise SystemExit(
-            "GigaAM is not installed.\n"
-            "pip install gigaam  (или git+https://github.com/salute-developers/GigaAM)\n"
-            f"Import error: {_IMPORT_ERR}"
-        )
-
-    # Модель (GPU если есть, иначе CPU)
+    # Загружаем модель
     model = gigaam.load_model(MODEL_NAME)
     if hasattr(model, "eval"):
         model.eval()
@@ -453,77 +486,41 @@ def main():
     except Exception:
         pass
 
-    # Сбор входных файлов
+    full_text, segments, _ = transcribe_file_sequential(
+        model=model,
+        path=Path(p),
+        repo_root=repo_root,
+        lang=lang,
+        vad_cfg=vad_cfg,
+        dedup_tail_chars=dedup_tail_chars,
+        min_dedup_overlap=min_dedup_overlap,
+        debug=debug,
+        use_tempfile=use_tempfile,
+        min_wps=min_wps,
+        min_cps=min_cps,
+        keep_all=keep_all,
+    )
+
+    return str(p), full_text, segments
+
+
+# ------------------------- MAIN -------------------------
+
+def main():
+    repo_root = configure_local_caches()
+
+    if gigaam is None:
+        raise SystemExit(
+            "GigaAM is not installed.\n"
+            "pip install gigaam  (или git+https://github.com/salute-developers/GigaAM)\n"
+            f"Import error: {_IMPORT_ERR}"
+        )
+
     input_path = Path(INPUT).resolve()
-    if not input_path.exists():
-        raise SystemExit(f"[ERROR] Input path does not exist: {INPUT}")
+    if not input_path.is_dir():
+        raise SystemExit(f"[ERROR] Input must be a directory, got: {INPUT}")
 
-    if input_path.suffix.lower() in {".jsonl", ".json"} and input_path.is_file():
-        audio_files: List[Path] = []
-        if input_path.suffix.lower() == ".jsonl":
-            with open(input_path, "r", encoding="utf-8-sig") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    obj = json.loads(line)
-                    p = obj.get("audio_filepath") or obj.get("audio")
-                    if p:
-                        pp = Path(p)
-                        if not pp.is_absolute():
-                            pp = (input_path.parent / pp).resolve()
-                        audio_files.append(pp)
-        else:  # .json
-            with open(input_path, "r", encoding="utf-8-sig") as f:
-                obj = json.load(f)
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    p = k if Path(k).suffix else (v.get("audio_filepath") or v.get("audio"))
-                    if p:
-                        pp = Path(p)
-                        if not pp.is_absolute():
-                            pp = (input_path.parent / pp).resolve()
-                        audio_files.append(pp)
-            elif isinstance(obj, list):
-                for it in obj:
-                    if isinstance(it, dict):
-                        p = it.get("audio_filepath") or it.get("audio")
-                        if p:
-                            pp = Path(p)
-                            if not pp.is_absolute():
-                                pp = (input_path.parent / pp).resolve()
-                            audio_files.append(pp)
-    else:
-        if input_path.is_file():
-            audio_files = [input_path]
-        else:
-            audio_files = sorted(
-                p for p in input_path.rglob("*")
-                if p.suffix.lower() in {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus"}
-            )
-
-    if not audio_files:
-        raise SystemExit(f"[ERROR] No audio files found for INPUT={INPUT}")
-
-    if SAMPLE and SAMPLE > 0 and len(audio_files) > SAMPLE:
-        import random
-        random.seed(42)
-        random.shuffle(audio_files)
-        audio_files = audio_files[:SAMPLE]
-
-    # RUPunct
-    rupunct = None
-    if PUNCT_RU:
-        if _HAVE_RUPUNCT:
-            try:
-                rupunct = rp.build_punct_pipeline()
-                print("[RUPunct] model loaded")
-            except Exception as e:
-                print(f"[RUPunct][WARN] cannot load model: {e}")
-                rupunct = None
-        else:
-            print(f"[RUPunct][WARN] cannot import rupunct_apply: {_RUPUNCT_IMPORT_ERR}")
-
-    # VAD конфиг (все значения — из глобалок сверху)
+    # VAD конфиг (общий для всех)
     vad_cfg = VadConfig(
         silero=SileroParams(
             threshold=SILERO_THRESHOLD,
@@ -541,89 +538,149 @@ def main():
             min_gap_sec=MIN_GAP_SEC,
             merge_close_segs=MERGE_CLOSE_SEGS,
             pack_bins=VAD_PACK_BINS,
+            max_bin_dur_sec=MAX_BIN_DUR_SEC,
         ),
     )
 
-    results: dict[str, str] = {}
+    out_base = Path(OUTPUT).parent
+    report_base = Path(OUTPUT_REPORT).parent
+    segments_base = Path(WRITE_SEGMENTS).resolve()
 
-    seg_writer = None
-    if WRITE_SEGMENTS:
-        Path(WRITE_SEGMENTS).parent.mkdir(parents=True, exist_ok=True)
-        seg_writer = open(WRITE_SEGMENTS, "w", encoding="utf-8")
+    # Обходим все подпапки рекурсивно
+    for root, dirs, files in os.walk(input_path):
+        root_path = Path(root)
+        audio_files = [
+            root_path / f
+            for f in files
+            if Path(f).suffix.lower() in {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus"}
+        ]
 
-    bs = max(1, int(BATCH_SIZE))
-    try:
-        for i in range(0, len(audio_files), bs):
-            batch_paths = audio_files[i:i + bs]
-            print(f"Transcribing batch {i // bs + 1} [{len(batch_paths)} files] ...")
+        if not audio_files:
+            continue
 
-            for p in batch_paths:
-                if not p.exists():
-                    print(f"[WARN] Skipping missing file: {p}")
-                    continue
-                full_text, segments, comparison_lines = transcribe_file_sequential(
-                    model=model,
-                    path=p,
-                    repo_root=repo_root,
-                    lang=LANG,
-                    vad_cfg=vad_cfg,
-                    dedup_tail_chars=int(DEDUP_TAIL_CHARS),
-                    min_dedup_overlap=int(MIN_DEDUP_OVERLAP),
-                    debug=bool(DEBUG),
-                    use_tempfile=bool(USE_TEMPFILE),
-                    min_wps=float(MIN_WPS),
-                    min_cps=float(MIN_CPS),
-                    keep_all=bool(KEEP_ALL),
-                )
+        if SAMPLE and SAMPLE > 0 and len(audio_files) > SAMPLE:
+            import random
+            random.seed(42)
+            random.shuffle(audio_files)
+            audio_files = audio_files[:SAMPLE]
 
-                # Пунктуация по сегментам
-                segments_punct: List[dict] = []
-                if PUNCT_RU and rupunct is not None:
+        results: dict[str, str] = {}
+        all_dialog_segments: List[dict] = []
+
+        relative = root_path.relative_to(input_path)
+        local_segments_dir = segments_base / relative
+        local_segments_dir.mkdir(parents=True, exist_ok=True)
+
+        # Последовательная обработка файлов в текущей подпапке
+        for p in audio_files:
+            result = process_single_file((
+                str(p), repo_root, vad_cfg, LANG, int(DEDUP_TAIL_CHARS), int(MIN_DEDUP_OVERLAP),
+                bool(DEBUG), bool(USE_TEMPFILE), float(MIN_WPS), float(MIN_CPS), bool(KEEP_ALL)
+            ))
+            file_path, full_text, segments = result
+
+            p = Path(file_path)
+            results[p.name] = full_text
+
+            if local_segments_dir:
+                seg_file = local_segments_dir / f"{p.stem}_segments.jsonl"
+                with open(seg_file, "w", encoding="utf-8") as seg_writer:
                     for s in segments:
-                        text = s["text"]
-                        try:
-                            text = rp.punctuate_text(rupunct, text) or text
-                        except Exception:
-                            pass
-                        segments_punct.append({**s, "text": text})
-                else:
-                    segments_punct = segments
-
-                full_text_punct = " ".join([seg["text"] for seg in segments_punct]).strip()
-                results[str(p)] = full_text_punct
-
-                if seg_writer and segments_punct:
-                    for sp in segments_punct:
                         obj = {
                             "audio": p.name,
-                            "start": _format_ts(sp["start"]),
-                            "end": _format_ts(sp["end"]),
-                            "duration": sp["end"] - sp["start"],
-                            "text": sp["text"],
+                            "start": _format_ts(s["start"]),
+                            "end": _format_ts(s["end"]),
+                            "duration": s["end"] - s["start"],
+                            "text": s["text"],
                         }
                         seg_writer.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                        all_dialog_segments.append({
+                            "audio": p.name,
+                            "start": s["start"],
+                            "end": s["end"],
+                            "text": s["text"],
+                        })
 
-        out_path = Path(OUTPUT)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", encoding="utf-8") as f:
+        # Проверяем, есть ли сегменты для диалога в текущей подпапке
+        if not all_dialog_segments:
+            if DEBUG:
+                print(f"[DEBUG] No segments found for dialog in {root}")
+            continue
+
+        # Объединяем последовательные реплики одного файла
+        sorted_segments = sorted(all_dialog_segments, key=lambda x: x["start"])
+        merged_segments = []
+        current_seg = None
+        for seg in sorted_segments:
+            if not seg["text"]:
+                continue
+            if current_seg is None:
+                current_seg = seg.copy()
+                continue
+            if (current_seg["audio"] == seg["audio"]) and (seg["start"] - current_seg["end"] <= MAX_DIALOG_GAP_SEC):
+                current_seg["text"] = current_seg["text"] + " " + seg["text"]
+                current_seg["end"] = seg["end"]
+            else:
+                merged_segments.append(current_seg)
+                current_seg = seg.copy()
+        if current_seg is not None:
+            merged_segments.append(current_seg)
+
+        # Применяем пунктуацию к объединённым репликам
+        if PUNCT_RU and _HAVE_RUPUNCT:
+            try:
+                rupunct = rp.build_punct_pipeline()
+                if DEBUG:
+                    print(f"[RUPunct] Model loaded for final dialog punctuation in {root}")
+                for seg in merged_segments:
+                    try:
+                        seg["text"] = rp.punctuate_text(rupunct, seg["text"]) or seg["text"]
+                    except Exception as e:
+                        if DEBUG:
+                            print(f"[RUPunct][WARN] Failed to punctuate segment in {root}: {e}")
+            except Exception as e:
+                if DEBUG:
+                    print(f"[RUPunct][WARN] Cannot load RUPunct model for {root}: {e}")
+
+        # Формируем финальный текст для results
+        results = {}
+        for seg in merged_segments:
+            audio = seg["audio"]
+            if audio not in results:
+                results[audio] = []
+            if seg["text"]:  # Пропускаем пустые тексты
+                results[audio].append(seg["text"])
+        results = {k: " ".join(v).strip() for k, v in results.items()}
+
+        # Записываем выходные файлы для текущей подпапки
+        local_out_path = out_base / relative / Path(OUTPUT).name
+        local_out_path.parent.mkdir(parents=True, exist_ok=True)
+        with local_out_path.open("w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
 
         if OUTPUT_FORMAT == "txt":
-            report_path = Path(OUTPUT_REPORT)
-            report_path.parent.mkdir(parents=True, exist_ok=True)
-            with report_path.open("w", encoding="utf-8") as f:
+            local_report_path = report_base / relative / Path(OUTPUT_REPORT).name
+            local_report_path.parent.mkdir(parents=True, exist_ok=True)
+            with local_report_path.open("w", encoding="utf-8") as f:
                 for p, txt in results.items():
                     f.write(f"{p}\n{txt}\n\n")
 
-    finally:
-        if seg_writer:
-            seg_writer.close()
-        try:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-        gc.collect()
+        dialog_file = local_segments_dir / f"dialog_{root_path.name}.jsonl"
+        with dialog_file.open("w", encoding="utf-8") as f:
+            for seg in merged_segments:
+                obj = {
+                    "audio": seg["audio"],
+                    "start": _format_ts(seg["start"]),
+                    "end": _format_ts(seg["end"]),
+                    "text": seg["text"],
+                }
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    try:
+        torch.cuda.synchronize(); torch.cuda.empty_cache()
+    except Exception:
+        pass
+    gc.collect()
 
 
 if __name__ == "__main__":
