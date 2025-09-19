@@ -10,7 +10,7 @@ Output JSONL adds: "text_punct": "..."
 Also writes transcript_punct.json -> {"Ilya_1_h.wav": "full punctuated text"}.
 """
 
-import argparse, json, sys, re
+import argparse, json, sys, re, logging
 from pathlib import Path
 from collections import defaultdict
 
@@ -18,6 +18,8 @@ from transformers import pipeline, AutoTokenizer
 
 # ---- model setup (per the HF model card) ----
 MODEL_ID = "RUPunct/RUPunct_big"  # https://huggingface.co/RUPunct/RUPunct_big
+
+log = logging.getLogger("RUPunct")
 
 def build_punct_pipeline():
     # Per model card: add_prefix_space=True, strip_accents=False
@@ -82,18 +84,76 @@ def postprocess_spaces(text: str) -> str:
         out = rx.sub(rep, out)
     return out.strip()
 
-def punctuate_text(clf, text: str) -> str:
-    if not text or not text.strip():
-        return text
+def _find_split_index(text: str) -> int:
+    """Locate a whitespace character closest to the middle of *text*."""
+    if len(text) < 2:
+        return -1
+    mid = len(text) // 2
+    # try to find whitespace scanning left from the midpoint first, then right
+    for idx in range(mid, 0, -1):
+        if text[idx - 1].isspace():
+            return idx - 1
+    for idx in range(mid, len(text)):
+        if text[idx].isspace():
+            return idx
+    return -1
+
+
+def _apply_model(clf, text: str) -> str:
     preds = clf(text)
-    # preds is list of dicts with 'word' and 'entity_group'
     parts = []
     for it in preds:
         token = (it.get("word") or "").strip()
         label = it.get("entity_group") or "LOWER_O"
         parts.append(process_token(token, label))
-    # join with spaces then fix spacing
     return postprocess_spaces(" ".join(parts))
+
+
+def punctuate_text(clf, text: str) -> str:
+    if not text or not text.strip():
+        return text
+
+    def _punct_segment(segment: str, depth: int = 0) -> str:
+        try:
+            return _apply_model(clf, segment)
+        except Exception as exc:  # pragma: no cover - defensive against HF pipeline failures
+            split_idx = _find_split_index(segment)
+            if split_idx == -1:
+                log.error(
+                    "RUPunct failed to punctuate segment (len=%d) with no split available",
+                    len(segment),
+                    exc_info=True,
+                )
+                raise
+            left = segment[:split_idx].rstrip()
+            right = segment[split_idx:].lstrip()
+            if not left or not right:
+                log.error(
+                    "RUPunct failed to split segment cleanly (len=%d)",
+                    len(segment),
+                    exc_info=True,
+                )
+                raise
+            log.warning(
+                "RUPunct pipeline fallback: splitting text (len=%d, depth=%d) after %s",
+                len(segment),
+                depth,
+                exc,
+            )
+            left_punct = _punct_segment(left, depth + 1)
+            right_punct = _punct_segment(right, depth + 1)
+            return postprocess_spaces(f"{left_punct} {right_punct}")
+
+    cleaned = text.strip()
+    try:
+        return _punct_segment(cleaned)
+    except Exception:
+        log.error(
+            "RUPunct pipeline failed even after attempting splits (len=%d)",
+            len(cleaned),
+            exc_info=True,
+        )
+        return text
 
 def main():
     ap = argparse.ArgumentParser()
