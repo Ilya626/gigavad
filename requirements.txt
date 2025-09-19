@@ -4,3 +4,4 @@ soundfile
 pytest
 transformers  # optional
 gigaam  # optional
+requests
