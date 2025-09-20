@@ -14,3 +14,6 @@ transcript.json
 segments.jsonl
 transcription.txt
 records
+
+# Local configuration for the summariser
+summarize_config.ini
