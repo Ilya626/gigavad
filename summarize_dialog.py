@@ -38,11 +38,21 @@ PASS_LABELS: tuple[str, ...] = ("Первый проход", "Уточнение
 # ====================================================================================
 
 import math
+import time
 from configparser import ConfigParser, Error as ConfigParserError
 from pathlib import Path
 from typing import Any, Optional
 
 import requests
+
+
+class OpenRouterRateLimitError(RuntimeError):
+    def __init__(self, message: str, attempts: int) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+        self.partial_summary: str = ""
+        self.failed_chunk: Optional[int] = None
+        self.partial_path: Optional[Path] = None
 
 
 class OpenRouterClient:
@@ -63,6 +73,7 @@ class OpenRouterClient:
         self.timeout = timeout
         self.dry_run = dry_run or not api_key
         self.debug = debug
+        self.retry_delays: tuple[int, ...] = (5, 10, 15, 20, 25, 30)
 
     def chat(self, messages: list[dict[str, Any]]) -> str:
         if self.dry_run:
@@ -80,25 +91,78 @@ class OpenRouterClient:
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
         }
-        if self.debug:
-            print(f"[OpenRouter] POST model={self.model} messages={len(messages)}")
+        model_name = self.model.lower()
+        if model_name.startswith("deepseek/deepseek-r1"):
+            payload.setdefault("reasoning", {"effort": "medium"})
+            payload.setdefault("include_reasoning", True)
 
-        resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
-            raise RuntimeError("OpenRouter вернул пустой ответ")
-        message = choices[0].get("message") or {}
-        content = message.get("content")
-        if not content:
-            raise RuntimeError("OpenRouter ответ без content")
-        return content.strip()
+        retry_index = 0
+        attempt = 0
+
+        while True:
+            attempt += 1
+            if self.debug:
+                print(
+                    f"[OpenRouter] POST model={self.model} messages={len(messages)} "
+                    f"attempt={attempt}"
+                )
+            try:
+                resp = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                raise RuntimeError(f"Ошибка запроса OpenRouter: {exc}") from exc
+
+            if resp.status_code == 429:
+                delay = (
+                    self.retry_delays[retry_index]
+                    if retry_index < len(self.retry_delays)
+                    else None
+                )
+                if delay is None:
+                    if not self._ask_more_attempts():
+                        err = OpenRouterRateLimitError(
+                            "OpenRouter ответил 429 Too Many Requests", attempt
+                        )
+                        raise err
+                    retry_index = 1
+                    delay = self.retry_delays[0]
+                else:
+                    retry_index += 1
+                if self.debug:
+                    print(
+                        f"[OpenRouter] 429 Too Many Requests, ждём {delay} с перед повтором"
+                    )
+                time.sleep(delay)
+                continue
+
+            retry_index = 0
+
+            try:
+                resp.raise_for_status()
+            except requests.HTTPError as exc:
+                text = resp.text.strip()
+                details = f" {text}" if text else ""
+                raise RuntimeError(
+                    f"OpenRouter запрос завершился ошибкой {resp.status_code}.{details}"
+                ) from exc
+
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise RuntimeError("Не удалось распарсить JSON от OpenRouter") from exc
+
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError("OpenRouter вернул пустой ответ")
+            message = choices[0].get("message") or {}
+            content = self._extract_output_text(message)
+            if not content:
+                raise RuntimeError("OpenRouter ответ без content")
+            return content
 
     def _dry_stub(self, messages: list[dict[str, Any]]) -> str:
         text = ""
@@ -108,6 +172,45 @@ class OpenRouterClient:
                 break
         preview = text.splitlines()[-1] if text else ""
         return "[dry-run]" if not preview else f"[dry-run] {preview[:120]}".strip()
+
+    def _extract_output_text(self, message: dict[str, Any]) -> str:
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if (item.get("type") or "").lower() == "thinking":
+                    continue
+                text = (item.get("text") or "").strip()
+                if text:
+                    parts.append(text)
+            if parts:
+                return "\n".join(parts).strip()
+        text = message.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+        return ""
+
+    def _ask_more_attempts(self) -> bool:
+        prompt = "OpenRouter продолжает слать 429. Повторить ещё 5 попыток? [y/N]: "
+        while True:
+            try:
+                reply = input(prompt)
+            except EOFError:
+                return False
+            if reply is None:
+                return False
+            answer = reply.strip().lower()
+            if not answer:
+                return False
+            if answer in {"y", "yes", "д", "да"}:
+                return True
+            if answer in {"n", "no", "н", "нет"}:
+                return False
+            print("Введите Y или N.")
 
 
 def load_openrouter_api_key(config_path: Path) -> Optional[str]:
@@ -261,7 +364,13 @@ def run_pass(
             pass_index=pass_index,
             total_passes=total_passes,
         )
-        running_summary = client.chat(messages)
+        try:
+            running_summary = client.chat(messages)
+        except OpenRouterRateLimitError as exc:
+            exc.partial_summary = (running_summary or "").strip()
+            index = chunk.get("index")
+            exc.failed_chunk = int(index) if isinstance(index, int) else None
+            raise
     return running_summary or ""
 
 
@@ -277,14 +386,21 @@ def summarise_dialogue(input_path: Path, client: Optional[OpenRouterClient] = No
 
     running_summary: Optional[str] = None
     for pass_index in range(TOTAL_PASSES):
-        running_summary = run_pass(
-            client=client,
-            cheat_sheet=cheat_sheet,
-            chunks=chunks,
-            initial_summary=running_summary,
-            pass_index=pass_index,
-            total_passes=TOTAL_PASSES,
-        )
+        try:
+            running_summary = run_pass(
+                client=client,
+                cheat_sheet=cheat_sheet,
+                chunks=chunks,
+                initial_summary=running_summary,
+                pass_index=pass_index,
+                total_passes=TOTAL_PASSES,
+            )
+        except OpenRouterRateLimitError as exc:
+            summary = exc.partial_summary or (running_summary or "")
+            summary = summary.strip()
+            path = _save_partial_summary(input_path, summary)
+            exc.partial_path = path
+            raise
     return running_summary or ""
 
 
@@ -302,6 +418,24 @@ def build_client() -> OpenRouterClient:
         dry_run=DRY_RUN,
         debug=DEBUG,
     )
+
+
+def _save_partial_summary(input_path: Path, summary: str) -> Optional[Path]:
+    summary = (summary or "").strip()
+    if not summary:
+        return None
+    if OUTPUT_TEXT:
+        target = Path(OUTPUT_TEXT).expanduser()
+    else:
+        stem = input_path.stem or input_path.name
+        suffix = input_path.suffix
+        if suffix:
+            name = f"{stem}.partial{suffix}"
+        else:
+            name = f"{input_path.name}.partial"
+        target = input_path.with_name(name)
+    _write_text(target, summary)
+    return target
 
 
 def _write_text(path: Path, value: str) -> None:
@@ -322,7 +456,20 @@ def main() -> None:
         print(f"[Summariser] Работаем с {input_path}")
 
     client = build_client()
-    final_summary = summarise_dialogue(input_path, client)
+
+    try:
+        final_summary = summarise_dialogue(input_path, client)
+    except OpenRouterRateLimitError as exc:
+        chunk_note = f" на фрагменте #{exc.failed_chunk}" if exc.failed_chunk else ""
+        print(
+            f"[OpenRouter] Превышен лимит запросов{chunk_note} после {exc.attempts} попыток."
+        )
+        if exc.partial_path:
+            print(f"[OpenRouter] Частичное резюме сохранено: {exc.partial_path}")
+        elif exc.partial_summary.strip():
+            print("[OpenRouter] Частичное резюме:\n")
+            print(exc.partial_summary.strip())
+        raise SystemExit(1)
 
     if OUTPUT_TEXT:
         _write_text(Path(OUTPUT_TEXT).expanduser(), final_summary)
