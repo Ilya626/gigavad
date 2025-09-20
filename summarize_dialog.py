@@ -4,15 +4,15 @@
 from __future__ import annotations
 
 # =============================== ГЛОБАЛЬНЫЕ НАСТРОЙКИ ===============================
-INPUT_DIALOG: str = "dialog.txt"              # Финальный текст диалога (dialog_*.txt)
-CHEAT_SHEET_FILE: str = ""                     # Готовый cheat sheet (TXT), "" — не отправлять
-OUTPUT_TEXT: str = ""                         # Путь для финального текста ("" — пропустить)
+INPUT_DIALOG: str = "out\\19_09\\dialog_19_09.txt"              # Финальный текст диалога (dialog_*.txt)
+CHEAT_SHEET_FILE: str = "out\\19_09\\Cheat_sheet.txt"                     # Готовый cheat sheet (TXT), "" — не отправлять
+OUTPUT_TEXT: str = "out\\19_09\\summary_19_09.txt"                         # Путь для финального текста ("" — пропустить)
 
 MODEL_NAME: str = "deepseek/deepseek-r1-0528:free"  # Модель OpenRouter
 CHUNK_COUNT: int = 5                           # Сколько окон по ~20%
 CHUNK_OVERLAP: int = 1                         # Перекрытие окон в сегментах
 TOTAL_PASSES: int = 2                          # Первый прогон + уточнение
-MAX_TOKENS: int = 1200                         # Лимит токенов на ответ
+MAX_TOKENS: int = 12000                         # Лимит токенов на ответ
 TEMPERATURE: float = 0.3                       # Температура модели
 REQUEST_TIMEOUT: int = 120                     # Таймаут HTTP-запроса, сек
 DRY_RUN: bool = False                          # True — не звонить в OpenRouter
@@ -32,8 +32,6 @@ USER_GUIDE: str = (
     "1. Хронология ключевых событий.\n"
     "2. Решения и конфликты.\n"
     "3. Персонажи, артефакты, термины.\n"
-    "4. Открытые вопросы.\n"
-    "Если встречается новое имя — фиксируй его."
 )
 
 PASS_LABELS: tuple[str, ...] = ("Первый проход", "Уточнение")
