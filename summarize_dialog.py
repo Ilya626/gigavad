@@ -41,8 +41,12 @@ PASS_LABELS: tuple[str, ...] = ("Первый проход", "Уточнение
 # ====================================================================================
 
 import math
+import random
 import time
+from collections import deque
 from configparser import ConfigParser, Error as ConfigParserError
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -76,7 +80,12 @@ class OpenRouterClient:
         self.timeout = timeout
         self.dry_run = dry_run or not api_key
         self.debug = debug
-        self.retry_delays: tuple[int, ...] = (15, 30, 60, 90, 120, 150)
+        self.retry_base_delay: float = 15.0
+        self.retry_max_delay: float = 180.0
+        self.retry_min_delay: float = 5.0
+        self.max_rate_limit_attempts: int = 6
+        self.max_requests_per_minute: int = 20
+        self._recent_requests: deque[float] = deque()
 
     def chat(self, messages: list[dict[str, Any]]) -> str:
         if self.dry_run:
@@ -85,7 +94,6 @@ class OpenRouterClient:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/salute-developers/gigavad",
             "X-Title": "GigaVAD dialogue summariser",
         }
         payload = {
@@ -110,6 +118,7 @@ class OpenRouterClient:
                     f"attempt={attempt}"
                 )
             try:
+                self._respect_rate_limit()
                 resp = requests.post(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers=headers,
@@ -120,24 +129,26 @@ class OpenRouterClient:
                 raise RuntimeError(f"Ошибка запроса OpenRouter: {exc}") from exc
 
             if resp.status_code == 429:
-                delay = (
-                    self.retry_delays[retry_index]
-                    if retry_index < len(self.retry_delays)
-                    else None
-                )
-                if delay is None:
+                retry_index += 1
+                if retry_index > self.max_rate_limit_attempts:
                     if not self._ask_more_attempts():
                         err = OpenRouterRateLimitError(
                             "OpenRouter ответил 429 Too Many Requests", attempt
                         )
                         raise err
                     retry_index = 1
-                    delay = self.retry_delays[0]
-                else:
-                    retry_index += 1
+                delay, header_value, from_header = self._calculate_retry_delay(
+                    resp, retry_index - 1
+                )
+                message = (
+                    "Retry-After=%r" % header_value
+                    if from_header
+                    else "Retry-After отсутствует"
+                )
                 if self.debug:
                     print(
-                        f"[OpenRouter] 429 Too Many Requests, ждём {delay} с перед повтором"
+                        "[OpenRouter] 429 Too Many Requests, %s, ждём %.1f с перед повтором"
+                        % (message, delay)
                     )
                 time.sleep(delay)
                 continue
@@ -158,6 +169,36 @@ class OpenRouterClient:
             except ValueError as exc:
                 raise RuntimeError("Не удалось распарсить JSON от OpenRouter") from exc
 
+            error_payload = data.get("error")
+            if isinstance(error_payload, dict):
+                code = str(error_payload.get("code") or "").lower()
+                message = error_payload.get("message") or "OpenRouter вернул ошибку"
+                if code == "rate_limit_exceeded":
+                    retry_index += 1
+                    if retry_index > self.max_rate_limit_attempts:
+                        if not self._ask_more_attempts():
+                            err = OpenRouterRateLimitError(
+                                "OpenRouter ответил 429 Too Many Requests", attempt
+                            )
+                            raise err
+                        retry_index = 1
+                    delay, header_value, from_header = self._calculate_retry_delay(
+                        resp, retry_index - 1
+                    )
+                    message_extra = (
+                        "Retry-After=%r" % header_value
+                        if from_header
+                        else "Retry-After отсутствует"
+                    )
+                    if self.debug:
+                        print(
+                            "[OpenRouter] rate_limit_exceeded, %s, ждём %.1f с перед повтором"
+                            % (message_extra, delay)
+                        )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(message)
+
             choices = data.get("choices") or []
             if not choices:
                 raise RuntimeError("OpenRouter вернул пустой ответ")
@@ -166,6 +207,71 @@ class OpenRouterClient:
             if not content:
                 raise RuntimeError("OpenRouter ответ без content")
             return content
+
+    def _respect_rate_limit(self) -> None:
+        if self.max_requests_per_minute <= 0:
+            return
+        window = 60.0
+        queue = self._recent_requests
+        while True:
+            now = time.monotonic()
+            while queue and now - queue[0] > window:
+                queue.popleft()
+            if len(queue) < self.max_requests_per_minute:
+                queue.append(now)
+                return
+            wait_time = window - (now - queue[0])
+            if wait_time <= 0:
+                queue.append(now)
+                return
+            if self.debug:
+                print(
+                    "[OpenRouter] Достигнут локальный лимит %d req/min, ждём %.1f с"
+                    % (self.max_requests_per_minute, wait_time)
+                )
+            time.sleep(wait_time)
+
+    def _calculate_retry_delay(
+        self, resp: requests.Response, attempt_index: int
+    ) -> tuple[float, str, bool]:
+        header_value = resp.headers.get("Retry-After", "")
+        retry_after = self._parse_retry_after(header_value)
+        if retry_after is not None and retry_after > 0:
+            return retry_after, header_value, True
+        delay = self._exponential_backoff(attempt_index)
+        return delay, header_value, False
+
+    def _parse_retry_after(self, value: Optional[str]) -> Optional[float]:
+        if value is None:
+            return None
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            seconds = float(raw)
+        except ValueError:
+            try:
+                retry_dt = parsedate_to_datetime(raw)
+            except (TypeError, ValueError, IndexError):
+                return None
+            if retry_dt is None:
+                return None
+            if retry_dt.tzinfo is None:
+                retry_dt = retry_dt.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            delta = (retry_dt - now).total_seconds()
+            return max(delta, 0.0)
+        else:
+            return max(seconds, 0.0)
+
+    def _exponential_backoff(self, attempt_index: int) -> float:
+        safe_index = max(0, attempt_index)
+        delay = self.retry_base_delay * (2 ** safe_index)
+        delay = min(delay, self.retry_max_delay)
+        jitter = random.uniform(0.8, 1.2)
+        delay *= jitter
+        delay = max(self.retry_min_delay, min(delay, self.retry_max_delay))
+        return delay
 
     def _dry_stub(self, messages: list[dict[str, Any]]) -> str:
         text = ""
