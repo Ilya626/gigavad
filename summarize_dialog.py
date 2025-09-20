@@ -14,7 +14,7 @@ CHUNK_OVERLAP: int = 1                         # Перекрытие окон �
 TOTAL_PASSES: int = 2                          # Первый прогон + уточнение
 MAX_TOKENS: int = 12000                         # Лимит токенов на ответ
 TEMPERATURE: float = 0.3                       # Температура модели
-REQUEST_TIMEOUT: int = 120                     # Таймаут HTTP-запроса, сек
+REQUEST_TIMEOUT: int = 60                     # Таймаут HTTP-запроса, сек
 DRY_RUN: bool = False                          # True — не звонить в OpenRouter
 DEBUG: bool = True                             # Печатать служебные сообщения
 
@@ -29,6 +29,8 @@ SYSTEM_PROMPT: str = (
 INCLUDE_SYSTEM_PROMPT: bool = False
 
 USER_GUIDE: str = (
+    "Ты — аналитик настольных RPG-сессий. Собирай структурированные резюме,"
+    " держи факты и индексы и не выдумывай события, которых нет в источнике.\n"
     "Формат ответа:\n"
     "1. Хронология ключевых событий.\n"
     "2. Решения и конфликты.\n"
@@ -74,7 +76,7 @@ class OpenRouterClient:
         self.timeout = timeout
         self.dry_run = dry_run or not api_key
         self.debug = debug
-        self.retry_delays: tuple[int, ...] = (5, 10, 15, 20, 25, 30)
+        self.retry_delays: tuple[int, ...] = (15, 30, 60, 90, 120, 150)
 
     def chat(self, messages: list[dict[str, Any]]) -> str:
         if self.dry_run:
