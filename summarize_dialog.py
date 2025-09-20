@@ -8,7 +8,7 @@ INPUT_DIALOG: str = "dialog.txt"              # Финальный текст д
 CHEAT_SHEET_FILE: str = ""                     # Готовый cheat sheet (TXT), "" — не отправлять
 OUTPUT_TEXT: str = ""                         # Путь для финального текста ("" — пропустить)
 
-MODEL_NAME: str = "deepseek/deepseek-r1"      # Модель OpenRouter
+MODEL_NAME: str = "deepseek/deepseek-r1-0528:free"  # Модель OpenRouter
 CHUNK_COUNT: int = 5                           # Сколько окон по ~20%
 CHUNK_OVERLAP: int = 1                         # Перекрытие окон в сегментах
 TOTAL_PASSES: int = 2                          # Первый прогон + уточнение
@@ -17,6 +17,10 @@ TEMPERATURE: float = 0.3                       # Температура моде
 REQUEST_TIMEOUT: int = 120                     # Таймаут HTTP-запроса, сек
 DRY_RUN: bool = False                          # True — не звонить в OpenRouter
 DEBUG: bool = True                             # Печатать служебные сообщения
+
+CONFIG_FILE: str = "summarize_config.ini"      # Файл с ключом OpenRouter
+CONFIG_SECTION: str = "openrouter"            # Секция в конфиге
+CONFIG_KEY: str = "api_key"                   # Ключ с API-ключом
 
 SYSTEM_PROMPT: str = (
     "Ты — аналитик настольных RPG-сессий. Собирай структурированные резюме,"
@@ -36,7 +40,7 @@ PASS_LABELS: tuple[str, ...] = ("Первый проход", "Уточнение
 # ====================================================================================
 
 import math
-import os
+from configparser import ConfigParser, Error as ConfigParserError
 from pathlib import Path
 from typing import Any, Optional
 
@@ -106,6 +110,36 @@ class OpenRouterClient:
                 break
         preview = text.splitlines()[-1] if text else ""
         return "[dry-run]" if not preview else f"[dry-run] {preview[:120]}".strip()
+
+
+def load_openrouter_api_key(config_path: Path) -> Optional[str]:
+    config_path = config_path.expanduser()
+    config_display = str(config_path)
+    if not config_path.exists():
+        if DEBUG:
+            print(f"[Config] Не найден файл конфига: {config_display}")
+        return None
+
+    parser = ConfigParser()
+    try:
+        with config_path.open("r", encoding="utf-8") as fp:
+            parser.read_file(fp)
+    except (OSError, ConfigParserError) as exc:
+        raise RuntimeError(f"Не удалось прочитать конфиг {config_display}: {exc}") from exc
+
+    if not parser.has_section(CONFIG_SECTION):
+        if DEBUG:
+            print(f"[Config] Нет секции '{CONFIG_SECTION}' в {config_display}")
+        return None
+
+    value = parser.get(CONFIG_SECTION, CONFIG_KEY, fallback="").strip()
+    if not value:
+        if DEBUG:
+            print(
+                f"[Config] В секции '{CONFIG_SECTION}' отсутствует значение '{CONFIG_KEY}'"
+            )
+        return None
+    return value
 
 
 def load_segments(path: Path) -> list[dict[str, Any]]:
@@ -257,7 +291,10 @@ def summarise_dialogue(input_path: Path, client: Optional[OpenRouterClient] = No
 
 
 def build_client() -> OpenRouterClient:
-    api_key = os.getenv("OPENROUTER_API_KEY") or None
+    config_path = Path(CONFIG_FILE)
+    if not config_path.is_absolute():
+        config_path = Path(__file__).resolve().parent / config_path
+    api_key = load_openrouter_api_key(config_path)
     return OpenRouterClient(
         model=MODEL_NAME,
         api_key=api_key,
