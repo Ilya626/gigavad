@@ -26,6 +26,7 @@ SYSTEM_PROMPT: str = (
     "Ты — аналитик настольных RPG-сессий. Собирай структурированные резюме,"
     " держи факты и индексы и не выдумывай события, которых нет в источнике."
 )
+INCLUDE_SYSTEM_PROMPT: bool = False
 
 USER_GUIDE: str = (
     "Формат ответа:\n"
@@ -167,9 +168,23 @@ class OpenRouterClient:
     def _dry_stub(self, messages: list[dict[str, Any]]) -> str:
         text = ""
         for msg in reversed(messages):
-            if msg.get("role") == "user":
-                text = msg.get("content", "")
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                text = content
                 break
+            if isinstance(content, list):
+                parts: list[str] = []
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    value = item.get("text")
+                    if isinstance(value, str) and value.strip():
+                        parts.append(value.strip())
+                if parts:
+                    text = "\n".join(parts)
+                    break
         preview = text.splitlines()[-1] if text else ""
         return "[dry-run]" if not preview else f"[dry-run] {preview[:120]}".strip()
 
@@ -322,7 +337,7 @@ def compose_messages(
     previous_summary: Optional[str],
     pass_index: int,
     total_passes: int,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     if pass_index < len(PASS_LABELS):
         pass_label = PASS_LABELS[pass_index]
     else:
@@ -341,10 +356,20 @@ def compose_messages(
     blocks.append(f"### Фрагмент #{chunk['index']}\n" + format_chunk(chunk))
     blocks.append(USER_GUIDE.strip())
 
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT.strip()},
-        {"role": "user", "content": "\n\n".join(blocks)},
-    ]
+    user_payload = {"type": "text", "text": "\n\n".join(blocks)}
+    system_prompt = SYSTEM_PROMPT.strip()
+
+    if INCLUDE_SYSTEM_PROMPT and system_prompt:
+        return [
+            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+            {"role": "user", "content": [user_payload]},
+        ]
+
+    content_blocks: list[dict[str, str]] = []
+    if system_prompt:
+        content_blocks.append({"type": "text", "text": f"{system_prompt}\n\n"})
+    content_blocks.append(user_payload)
+    return [{"role": "user", "content": content_blocks}]
 
 
 def run_pass(
