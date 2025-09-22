@@ -323,6 +323,8 @@ def transcribe_file_sequential(
     repo_root: Path,
     lang: Optional[str],
     vad_cfg: VadConfig,
+    vad_processor: Optional[VADProcessor] = None,
+    *,
     dedup_tail_chars: int,
     min_dedup_overlap: int,
     debug: bool,
@@ -340,17 +342,19 @@ def transcribe_file_sequential(
         return "", [], []
 
     # VAD → чанки
-    vad_processor = VADProcessor(
-        threshold=vad_cfg.silero.threshold,
-        min_speech_ms=vad_cfg.silero.min_speech_ms,
-        min_silence_ms=vad_cfg.silero.min_silence_ms,
-        speech_pad_ms=vad_cfg.silero.speech_pad_ms,
-        max_speech_duration_s=vad_cfg.params.target_speech_sec + vad_cfg.params.max_overshoot_sec,  # 15 + 2 = 17 сек
-        max_bin_dur_sec=vad_cfg.params.max_bin_dur_sec,  # 20 сек
-        use_cuda=(vad_cfg.silero.use_cuda and torch.cuda.is_available()),
-        model_dir=vad_cfg.silero.model_dir,
-    )
-    chunks, speech_secs = slice_with_silero_vad(sr, audio, vad_processor, vad_cfg.params)
+    active_vad = vad_processor
+    if active_vad is None:
+        active_vad = VADProcessor(
+            threshold=vad_cfg.silero.threshold,
+            min_speech_ms=vad_cfg.silero.min_speech_ms,
+            min_silence_ms=vad_cfg.silero.min_silence_ms,
+            speech_pad_ms=vad_cfg.silero.speech_pad_ms,
+            max_speech_duration_s=vad_cfg.params.target_speech_sec + vad_cfg.params.max_overshoot_sec,
+            max_bin_dur_sec=vad_cfg.params.max_bin_dur_sec,
+            use_cuda=(vad_cfg.silero.use_cuda and torch.cuda.is_available()),
+            model_dir=vad_cfg.silero.model_dir,
+        )
+    chunks, speech_secs = slice_with_silero_vad(sr, audio, active_vad, vad_cfg.params)
 
     if debug:
         print(f"[CHUNKS] {path.name}: {len(chunks)} chunks; VAD only; pack={vad_cfg.params.pack_bins}")
@@ -452,13 +456,14 @@ def transcribe_file_sequential(
                 full_text_parts.append(keep_text)
                 seg["text"] = keep_text
 
+    full_text = " ".join([t for t in full_text_parts if t]).strip()
+
+    if debug:
         gc.collect()
         try:
             torch.cuda.empty_cache()
         except Exception:
             pass
-
-    full_text = " ".join([t for t in full_text_parts if t]).strip()
 
     comparison_lines: List[str] = []
     if speech_secs:
@@ -470,28 +475,49 @@ def transcribe_file_sequential(
 
 # ------------------------- Функция для обработки одного файла -------------------------
 
-def process_single_file(args):
-    p, repo_root, vad_cfg, lang, dedup_tail_chars, min_dedup_overlap, debug, use_tempfile, min_wps, min_cps, keep_all = args
+def process_single_file(
+    path: Path,
+    repo_root: Path,
+    vad_cfg: VadConfig,
+    vad_processor: Optional[VADProcessor],
+    model,
+    lang: Optional[str],
+    dedup_tail_chars: int,
+    min_dedup_overlap: int,
+    debug: bool,
+    use_tempfile: bool,
+    min_wps: float,
+    min_cps: float,
+    keep_all: bool,
+):
+    p = Path(path)
 
-    # Загружаем модель
-    model = gigaam.load_model(MODEL_NAME)
-    if hasattr(model, "eval"):
-        model.eval()
-    try:
-        if torch.cuda.is_available():
-            if hasattr(model, "to"):
-                model = model.to("cuda")
-            elif hasattr(model, "cuda"):
-                model = model.cuda()
-    except Exception:
-        pass
+    local_model = model
+    if local_model is None:
+        if gigaam is None:
+            raise RuntimeError(
+                "GigaAM is not installed.\n"
+                "pip install gigaam (или git+https://github.com/salute-developers/GigaAM)"
+            )
+        local_model = gigaam.load_model(MODEL_NAME)
+        if hasattr(local_model, "eval"):
+            local_model.eval()
+        try:
+            if torch.cuda.is_available():
+                if hasattr(local_model, "to"):
+                    local_model = local_model.to("cuda")
+                elif hasattr(local_model, "cuda"):
+                    local_model = local_model.cuda()
+        except Exception:
+            pass
 
     full_text, segments, _ = transcribe_file_sequential(
-        model=model,
-        path=Path(p),
+        model=local_model,
+        path=p,
         repo_root=repo_root,
         lang=lang,
         vad_cfg=vad_cfg,
+        vad_processor=vad_processor,
         dedup_tail_chars=dedup_tail_chars,
         min_dedup_overlap=min_dedup_overlap,
         debug=debug,
@@ -542,6 +568,29 @@ def main():
         ),
     )
 
+    vad_processor = VADProcessor(
+        threshold=vad_cfg.silero.threshold,
+        min_speech_ms=vad_cfg.silero.min_speech_ms,
+        min_silence_ms=vad_cfg.silero.min_silence_ms,
+        speech_pad_ms=vad_cfg.silero.speech_pad_ms,
+        max_speech_duration_s=vad_cfg.params.target_speech_sec + vad_cfg.params.max_overshoot_sec,
+        max_bin_dur_sec=vad_cfg.params.max_bin_dur_sec,
+        use_cuda=(vad_cfg.silero.use_cuda and torch.cuda.is_available()),
+        model_dir=vad_cfg.silero.model_dir,
+    )
+
+    model = gigaam.load_model(MODEL_NAME)
+    if hasattr(model, "eval"):
+        model.eval()
+    try:
+        if torch.cuda.is_available():
+            if hasattr(model, "to"):
+                model = model.to("cuda")
+            elif hasattr(model, "cuda"):
+                model = model.cuda()
+    except Exception:
+        pass
+
     out_base = Path(OUTPUT).parent
     report_base = Path(OUTPUT_REPORT).parent
     segments_base = Path(WRITE_SEGMENTS).resolve()
@@ -573,11 +622,21 @@ def main():
 
         # Последовательная обработка файлов в текущей подпапке
         for p in audio_files:
-            result = process_single_file((
-                str(p), repo_root, vad_cfg, LANG, int(DEDUP_TAIL_CHARS), int(MIN_DEDUP_OVERLAP),
-                bool(DEBUG), bool(USE_TEMPFILE), float(MIN_WPS), float(MIN_CPS), bool(KEEP_ALL)
-            ))
-            file_path, full_text, segments = result
+            file_path, full_text, segments = process_single_file(
+                path=p,
+                repo_root=repo_root,
+                vad_cfg=vad_cfg,
+                vad_processor=vad_processor,
+                model=model,
+                lang=LANG,
+                dedup_tail_chars=int(DEDUP_TAIL_CHARS),
+                min_dedup_overlap=int(MIN_DEDUP_OVERLAP),
+                debug=bool(DEBUG),
+                use_tempfile=bool(USE_TEMPFILE),
+                min_wps=float(MIN_WPS),
+                min_cps=float(MIN_CPS),
+                keep_all=bool(KEEP_ALL),
+            )
 
             p = Path(file_path)
             results[p.name] = full_text
