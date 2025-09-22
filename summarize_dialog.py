@@ -4,14 +4,14 @@
 from __future__ import annotations
 
 # =============================== ГЛОБАЛЬНЫЕ НАСТРОЙКИ ===============================
-INPUT_DIALOG: str = "out\\19_09\\dialog_19_09.txt"              # Финальный текст диалога (dialog_*.txt)
+INPUT_DIALOG: str = "out\\19_09\\dialog_19_09.jsonl"              # Финальный текст диалога (dialog_*.txt)
 CHEAT_SHEET_FILE: str = "out\\19_09\\Cheat_sheet.txt"                     # Готовый cheat sheet (TXT), "" — не отправлять
 OUTPUT_TEXT: str = "out\\19_09\\summary_19_09.txt"                         # Путь для финального текста ("" — пропустить)
 
-MODEL_NAME: str = "deepseek/deepseek-r1-0528:free"  # Модель OpenRouter
+MODEL_NAME: str = "deepseek/deepseek-chat-v3.1:free"  # Модель OpenRouter
 CHUNK_COUNT: int = 5                           # Сколько окон по ~20%
 CHUNK_OVERLAP: int = 1                         # Перекрытие окон в сегментах
-TOTAL_PASSES: int = 2                          # Первый прогон + уточнение
+TOTAL_PASSES: int = 1                          # Первый прогон + уточнение
 MAX_TOKENS: int = 12000                         # Лимит токенов на ответ
 TEMPERATURE: float = 0.3                       # Температура модели
 REQUEST_TIMEOUT: int = 60                     # Таймаут HTTP-запроса, сек
@@ -30,17 +30,18 @@ INCLUDE_SYSTEM_PROMPT: bool = False
 
 USER_GUIDE: str = (
     "Ты — аналитик настольных RPG-сессий. Собирай структурированные резюме,"
-    " держи факты и индексы и не выдумывай события, которых нет в источнике.\n"
+    " держи факты и индексы и не выдумывай события, которых нет в источнике. Ты имеешь читшит по именами и Луту, а так же информацию из прошлых частей резюме. Опиши новую часть, включив её в резюме. Если её нет - прост пиши резюме.\n"
     "Формат ответа:\n"
     "1. Хронология ключевых событий.\n"
     "2. Решения и конфликты.\n"
-    "3. Персонажи, артефакты, термины.\n"
+    "3. Персонажи, артефакты, термины.\n ПОМНИ, ТЫ ДОЛЖЕН ПИСАТЬ ПОЛНОЕ РЕЗЮМЕ С УЧЕТОМ ПРОШЛЫХ ЧАСТЕЙ. ТВОЙ ОТВЕТ - ПОЛНОЦЕННОЕ РЕЗЮМЕ ВКЛЮЧАЯ НОВУЮ ЧАСТЬ."
 )
 
 PASS_LABELS: tuple[str, ...] = ("Первый проход", "Уточнение")
 # ====================================================================================
 
 import math
+import json
 import random
 import time
 from collections import deque
@@ -80,10 +81,10 @@ class OpenRouterClient:
         self.timeout = timeout
         self.dry_run = dry_run or not api_key
         self.debug = debug
-        self.retry_base_delay: float = 15.0
-        self.retry_max_delay: float = 180.0
+        self.retry_base_delay: float = 10.0
+        self.retry_max_delay: float = 60.0
         self.retry_min_delay: float = 5.0
-        self.max_rate_limit_attempts: int = 6
+        self.max_rate_limit_attempts: int = 100
         self.max_requests_per_minute: int = 20
         self._recent_requests: deque[float] = deque()
 
@@ -366,29 +367,49 @@ def load_openrouter_api_key(config_path: Path) -> Optional[str]:
     return value
 
 
+
+
 def load_segments(path: Path) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as fp:
         for line in fp:
             raw = line.strip()
-            if not raw or ":" not in raw:
+            if not raw:
                 continue
-            speaker_part, text_part = raw.split(":", 1)
-            speaker = speaker_part.strip() or "Unknown"
-            text_value = text_part.strip()
-            if text_value.startswith("\"") and text_value.endswith("\""):
-                text_value = text_value[1:-1]
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                if ":" not in raw:
+                    continue
+                speaker_part, text_part = raw.split(":", 1)
+                speaker = speaker_part.strip() or "Unknown"
+                text_value = text_part.strip()
+                if text_value.startswith('"') and text_value.endswith('"'):
+                    text_value = text_value[1:-1]
+                if not text_value:
+                    continue
+                data = {"speaker": speaker, "text": text_value}
+            text_value = data.get("text")
+            if not isinstance(text_value, str):
+                continue
+            text_value = text_value.strip()
             if not text_value:
                 continue
-            segments.append(
-                {
-                    "speaker": speaker,
-                    "text": text_value.strip(),
-                    "index": len(segments) + 1,
-                }
-            )
+            speaker_value = data.get("speaker") or data.get("audio") or "Unknown"
+            if not isinstance(speaker_value, str):
+                speaker_value = "Unknown"
+            speaker_value = speaker_value.strip() or "Unknown"
+            segment: dict[str, Any] = {
+                "speaker": speaker_value,
+                "text": text_value,
+                "index": len(segments) + 1,
+            }
+            for extra_key in ("audio", "start", "end"):
+                extra_value = data.get(extra_key)
+                if extra_value is not None:
+                    segment[extra_key] = extra_value
+            segments.append(segment)
     return segments
-
 
 def format_chunk(chunk: dict[str, Any]) -> str:
     segments = chunk.get("segments") or []
@@ -488,22 +509,41 @@ def run_pass(
     pass_index: int,
     total_passes: int,
 ) -> str:
+    summary_history: list[str] = []
+    if initial_summary:
+        cleaned_initial = initial_summary.strip()
+        if cleaned_initial:
+            summary_history.append(cleaned_initial)
     running_summary = initial_summary
     for chunk in chunks:
-        messages = compose_messages(
+        previous_summary = "\n\n".join(summary_history).strip()
+        composed = compose_messages(
             cheat_sheet=cheat_sheet,
             chunk=chunk,
-            previous_summary=running_summary,
+            previous_summary=previous_summary or None,
             pass_index=pass_index,
             total_passes=total_passes,
         )
+        conversation: list[dict[str, Any]] = []
+        for past_summary in summary_history:
+            conversation.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": past_summary}],
+                }
+            )
+        conversation.extend(composed)
         try:
-            running_summary = client.chat(messages)
+            response = client.chat(conversation)
         except OpenRouterRateLimitError as exc:
-            exc.partial_summary = (running_summary or "").strip()
+            exc.partial_summary = previous_summary
             index = chunk.get("index")
             exc.failed_chunk = int(index) if isinstance(index, int) else None
             raise
+        running_summary = response
+        cleaned = (response or "").strip()
+        if cleaned:
+            summary_history.append(cleaned)
     return running_summary or ""
 
 
