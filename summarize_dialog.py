@@ -49,7 +49,7 @@ from configparser import ConfigParser, Error as ConfigParserError
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -168,7 +168,23 @@ class OpenRouterClient:
             try:
                 data = resp.json()
             except ValueError as exc:
-                raise RuntimeError("Не удалось распарсить JSON от OpenRouter") from exc
+                raw_preview = resp.text.strip()
+                max_preview = 500
+                if raw_preview:
+                    preview = raw_preview[:max_preview]
+                    if len(raw_preview) > max_preview:
+                        preview += "…"
+                else:
+                    preview = ""
+                if self.debug and preview:
+                    print(
+                        "[OpenRouter] Ответ не в формате JSON (фрагмент):\n"
+                        f"{preview}"
+                    )
+                message = "Не удалось распарсить JSON от OpenRouter"
+                if preview:
+                    message += ". Фрагмент ответа:\n" + preview
+                raise RuntimeError(message) from exc
 
             error_payload = data.get("error")
             if isinstance(error_payload, dict):
@@ -508,6 +524,7 @@ def run_pass(
     initial_summary: Optional[str],
     pass_index: int,
     total_passes: int,
+    progress_callback: Optional[Callable[[str, Optional[int], int], None]] = None,
 ) -> str:
     summary_history: list[str] = []
     if initial_summary:
@@ -515,7 +532,24 @@ def run_pass(
         if cleaned_initial:
             summary_history.append(cleaned_initial)
     running_summary = initial_summary
+
+    def emit_progress(text: Optional[str], chunk_no: Optional[int]) -> None:
+        if progress_callback is None:
+            return
+        cleaned_text = (text or "").strip()
+        if not cleaned_text:
+            return
+        progress_callback(cleaned_text, chunk_no, pass_index)
+
     for chunk in chunks:
+        raw_index = chunk.get("index")
+        if isinstance(raw_index, int):
+            chunk_number: Optional[int] = raw_index
+        else:
+            try:
+                chunk_number = int(str(raw_index))
+            except (TypeError, ValueError):
+                chunk_number = None
         previous_summary = "\n\n".join(summary_history).strip()
         composed = compose_messages(
             cheat_sheet=cheat_sheet,
@@ -537,13 +571,17 @@ def run_pass(
             response = client.chat(conversation)
         except OpenRouterRateLimitError as exc:
             exc.partial_summary = previous_summary
-            index = chunk.get("index")
-            exc.failed_chunk = int(index) if isinstance(index, int) else None
+            exc.failed_chunk = chunk_number if isinstance(chunk_number, int) else None
+            emit_progress(running_summary, chunk_number)
+            raise
+        except Exception:
+            emit_progress(running_summary, chunk_number)
             raise
         running_summary = response
         cleaned = (response or "").strip()
         if cleaned:
             summary_history.append(cleaned)
+            emit_progress(cleaned, chunk_number)
     return running_summary or ""
 
 
@@ -558,6 +596,29 @@ def summarise_dialogue(input_path: Path, client: Optional[OpenRouterClient] = No
         client = build_client()
 
     running_summary: Optional[str] = None
+    last_saved_summary = ""
+    last_saved_path: Optional[Path] = None
+
+    def handle_progress(summary: str, chunk_index: Optional[int], pass_no: int) -> None:
+        nonlocal last_saved_summary, last_saved_path
+        trimmed = (summary or "").strip()
+        if not trimmed or trimmed == last_saved_summary:
+            return
+        path = _save_partial_summary(input_path, trimmed)
+        last_saved_summary = trimmed
+        if path is not None:
+            last_saved_path = path
+            if DEBUG:
+                chunk_note = (
+                    f", фрагмент {chunk_index}"
+                    if isinstance(chunk_index, int) and chunk_index > 0
+                    else ""
+                )
+                print(
+                    "[Summariser] Промежуточный результат сохранён (проход %d%s): %s"
+                    % (pass_no + 1, chunk_note, path)
+                )
+
     for pass_index in range(TOTAL_PASSES):
         try:
             running_summary = run_pass(
@@ -567,12 +628,35 @@ def summarise_dialogue(input_path: Path, client: Optional[OpenRouterClient] = No
                 initial_summary=running_summary,
                 pass_index=pass_index,
                 total_passes=TOTAL_PASSES,
+                progress_callback=handle_progress,
             )
         except OpenRouterRateLimitError as exc:
             summary = exc.partial_summary or (running_summary or "")
             summary = summary.strip()
-            path = _save_partial_summary(input_path, summary)
-            exc.partial_path = path
+            path: Optional[Path] = None
+            if summary and summary != last_saved_summary:
+                path = _save_partial_summary(input_path, summary)
+                last_saved_summary = summary
+                if path is not None:
+                    last_saved_path = path
+            exc.partial_path = last_saved_path or path
+            raise
+        except Exception:
+            summary = (running_summary or "").strip()
+            path: Optional[Path] = None
+            if summary and summary != last_saved_summary:
+                path = _save_partial_summary(input_path, summary)
+                last_saved_summary = summary
+                if path is not None:
+                    last_saved_path = path
+                    if DEBUG:
+                        print(
+                            f"[Summariser] Прогресс сохранён перед ошибкой: {path}"
+                        )
+            elif last_saved_path is not None and DEBUG:
+                print(
+                    f"[Summariser] Используем ранее сохранённый прогресс: {last_saved_path}"
+                )
             raise
     return running_summary or ""
 
