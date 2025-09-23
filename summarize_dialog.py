@@ -95,6 +95,7 @@ class OpenRouterClient:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
             "X-Title": "GigaVAD dialogue summariser",
         }
         payload = {
@@ -102,6 +103,7 @@ class OpenRouterClient:
             "messages": messages,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
+            "stream": False,
         }
         model_name = self.model.lower()
         if model_name.startswith("deepseek/deepseek-r1"):
@@ -110,6 +112,8 @@ class OpenRouterClient:
 
         retry_index = 0
         attempt = 0
+        parse_retry_used = False
+        raw_dumps: list[Path] = []
 
         while True:
             attempt += 1
@@ -166,24 +170,32 @@ class OpenRouterClient:
                 ) from exc
 
             try:
-                data = resp.json()
+                data = self._load_json_response(resp)
             except ValueError as exc:
-                raw_preview = resp.text.strip()
-                max_preview = 500
-                if raw_preview:
-                    preview = raw_preview[:max_preview]
-                    if len(raw_preview) > max_preview:
-                        preview += "…"
-                else:
-                    preview = ""
-                if self.debug and preview:
+                raw_body = resp.text or ""
+                preview = self._make_preview(raw_body)
+                raw_path = self._save_raw_response(raw_body, attempt)
+                if raw_path is not None:
+                    raw_dumps.append(raw_path)
+                if self.debug:
                     print(
-                        "[OpenRouter] Ответ не в формате JSON (фрагмент):\n"
-                        f"{preview}"
+                        "[OpenRouter] Ответ не в формате JSON, попытка %d" % attempt
                     )
+                    if preview:
+                        print(preview)
+                    if raw_path is not None:
+                        print(f"[OpenRouter] Сырой ответ сохранён: {raw_path}")
+                if not parse_retry_used:
+                    parse_retry_used = True
+                    if self.debug:
+                        print("[OpenRouter] Повторяем запрос после ошибки парсинга")
+                    continue
                 message = "Не удалось распарсить JSON от OpenRouter"
                 if preview:
                     message += ". Фрагмент ответа:\n" + preview
+                if raw_dumps:
+                    saved_list = "\n".join(f"- {path}" for path in raw_dumps)
+                    message += "\nСырые ответы сохранены:\n" + saved_list
                 raise RuntimeError(message) from exc
 
             error_payload = data.get("error")
@@ -224,6 +236,139 @@ class OpenRouterClient:
             if not content:
                 raise RuntimeError("OpenRouter ответ без content")
             return content
+
+    def _load_json_response(self, resp: requests.Response) -> dict[str, Any]:
+        try:
+            data = resp.json()
+        except ValueError:
+            body = resp.text or ""
+            lines: list[str] = []
+            for raw in body.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith(("event:", "id:", "retry:")):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if not line or line == "[DONE]":
+                    continue
+                lines.append(line)
+            payload = "\n".join(lines) or body.strip()
+            decoder = json.JSONDecoder()
+            index = 0
+            objects: list[dict[str, Any]] = []
+            length = len(payload)
+            while index < length:
+                while index < length and payload[index].isspace():
+                    index += 1
+                if index >= length:
+                    break
+                try:
+                    parsed, offset = decoder.raw_decode(payload, index)
+                except json.JSONDecodeError:
+                    index += 1
+                    continue
+                if isinstance(parsed, dict):
+                    objects.append(parsed)
+                index = offset
+            if not objects:
+                raise ValueError("Ответ OpenRouter не является JSON")
+
+            message: Optional[dict[str, Any]] = None
+            role = "assistant"
+            pieces: list[str] = []
+
+            def push_text(value: Any) -> None:
+                if isinstance(value, str):
+                    if value:
+                        pieces.append(value)
+                    return
+                if isinstance(value, list):
+                    for item in value:
+                        push_text(item)
+                    return
+                if isinstance(value, dict):
+                    kind = (value.get("type") or "").lower()
+                    if kind in {"reasoning", "thinking"}:
+                        return
+                    push_text(value.get("text"))
+                    push_text(value.get("content"))
+                    return
+
+            for obj in objects:
+                choices = obj.get("choices")
+                if isinstance(choices, list):
+                    for choice in choices:
+                        if not isinstance(choice, dict):
+                            continue
+                        candidate = choice.get("message")
+                        if isinstance(candidate, dict):
+                            message = candidate
+                            break
+                        delta = choice.get("delta")
+                        if isinstance(delta, dict):
+                            new_role = delta.get("role")
+                            if isinstance(new_role, str) and new_role:
+                                role = new_role
+                            push_text(delta.get("content"))
+                            push_text(delta.get("text"))
+                    if message is not None:
+                        break
+                direct = obj.get("message")
+                if isinstance(direct, dict):
+                    message = direct
+                    break
+                response = obj.get("response")
+                if isinstance(response, dict):
+                    push_text(response.get("output"))
+                    push_text(response.get("text"))
+                    candidate = response.get("message")
+                    if isinstance(candidate, dict):
+                        message = candidate
+                        break
+            if message is not None:
+                data = {"choices": [{"message": message}]}
+            elif pieces:
+                data = {
+                    "choices": [
+                        {"message": {"role": role, "content": "".join(pieces)}}
+                    ]
+                }
+            else:
+                data = objects[0]
+        if isinstance(data, dict):
+            return data
+        raise ValueError("Ответ OpenRouter имеет неподдерживаемый формат")
+
+    def _make_preview(self, raw: str, limit: int = 500) -> str:
+        text = (raw or "").strip()
+        if not text:
+            return ""
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "…"
+
+    def _save_raw_response(self, body: str, attempt: int) -> Optional[Path]:
+        if not body:
+            return None
+        directory = Path("openrouter_raw")
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = f"{timestamp}_attempt{attempt}"
+        candidate = directory / f"{base_name}.txt"
+        counter = 1
+        while candidate.exists():
+            candidate = directory / f"{base_name}_{counter}.txt"
+            counter += 1
+        try:
+            candidate.write_text(body, encoding="utf-8")
+        except OSError:
+            return None
+        return candidate
 
     def _respect_rate_limit(self) -> None:
         if self.max_requests_per_minute <= 0:
