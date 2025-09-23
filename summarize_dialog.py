@@ -242,176 +242,104 @@ class OpenRouterClient:
             data = resp.json()
         except ValueError:
             body = resp.text or ""
-            data = self._extract_json_from_body(body)
-            if data is None:
+            lines: list[str] = []
+            for raw in body.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith(("event:", "id:", "retry:")):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if not line or line == "[DONE]":
+                    continue
+                lines.append(line)
+            payload = "\n".join(lines) or body.strip()
+            decoder = json.JSONDecoder()
+            index = 0
+            objects: list[dict[str, Any]] = []
+            length = len(payload)
+            while index < length:
+                while index < length and payload[index].isspace():
+                    index += 1
+                if index >= length:
+                    break
+                try:
+                    parsed, offset = decoder.raw_decode(payload, index)
+                except json.JSONDecodeError:
+                    index += 1
+                    continue
+                if isinstance(parsed, dict):
+                    objects.append(parsed)
+                index = offset
+            if not objects:
                 raise ValueError("Ответ OpenRouter не является JSON")
+
+            message: Optional[dict[str, Any]] = None
+            role = "assistant"
+            pieces: list[str] = []
+
+            def push_text(value: Any) -> None:
+                if isinstance(value, str):
+                    if value:
+                        pieces.append(value)
+                    return
+                if isinstance(value, list):
+                    for item in value:
+                        push_text(item)
+                    return
+                if isinstance(value, dict):
+                    kind = (value.get("type") or "").lower()
+                    if kind in {"reasoning", "thinking"}:
+                        return
+                    push_text(value.get("text"))
+                    push_text(value.get("content"))
+                    return
+
+            for obj in objects:
+                choices = obj.get("choices")
+                if isinstance(choices, list):
+                    for choice in choices:
+                        if not isinstance(choice, dict):
+                            continue
+                        candidate = choice.get("message")
+                        if isinstance(candidate, dict):
+                            message = candidate
+                            break
+                        delta = choice.get("delta")
+                        if isinstance(delta, dict):
+                            new_role = delta.get("role")
+                            if isinstance(new_role, str) and new_role:
+                                role = new_role
+                            push_text(delta.get("content"))
+                            push_text(delta.get("text"))
+                    if message is not None:
+                        break
+                direct = obj.get("message")
+                if isinstance(direct, dict):
+                    message = direct
+                    break
+                response = obj.get("response")
+                if isinstance(response, dict):
+                    push_text(response.get("output"))
+                    push_text(response.get("text"))
+                    candidate = response.get("message")
+                    if isinstance(candidate, dict):
+                        message = candidate
+                        break
+            if message is not None:
+                data = {"choices": [{"message": message}]}
+            elif pieces:
+                data = {
+                    "choices": [
+                        {"message": {"role": role, "content": "".join(pieces)}}
+                    ]
+                }
+            else:
+                data = objects[0]
         if isinstance(data, dict):
             return data
         raise ValueError("Ответ OpenRouter имеет неподдерживаемый формат")
-
-    def _extract_json_from_body(self, body: str) -> Optional[dict[str, Any]]:
-        text = (body or "").strip()
-        if not text:
-            return None
-
-        cleaned: list[str] = []
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            if line.startswith(("event:", "id:", "retry:")):
-                continue
-            if line.startswith("data:"):
-                line = line[5:].strip()
-            if not line or line == "[DONE]":
-                continue
-            cleaned.append(line)
-
-        payload = "\n".join(cleaned) or text
-
-        objects: list[dict[str, Any]] = []
-        for chunk in self._split_json_chunks(payload):
-            try:
-                parsed = json.loads(chunk)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, dict):
-                objects.append(parsed)
-
-        if not objects:
-            return None
-
-        for item in objects:
-            choices = item.get("choices")
-            if isinstance(choices, list) and choices:
-                first = choices[0]
-                if isinstance(first, dict) and isinstance(first.get("message"), dict):
-                    return item
-
-        message = self._glue_stream_message(objects)
-        if message is not None:
-            return {"choices": [{"message": message}]}
-
-        return objects[0]
-
-    def _split_json_chunks(self, text: str) -> list[str]:
-        pieces: list[str] = []
-        depth = 0
-        start = -1
-        in_string = False
-        escape = False
-        for index, char in enumerate(text):
-            if in_string:
-                if escape:
-                    escape = False
-                elif char == "\\":
-                    escape = True
-                elif char == '"':
-                    in_string = False
-                continue
-            if char == '"':
-                in_string = True
-                continue
-            if char == "{":
-                if depth == 0:
-                    start = index
-                depth += 1
-                continue
-            if char == "}":
-                if depth == 0:
-                    continue
-                depth -= 1
-                if depth == 0 and start != -1:
-                    pieces.append(text[start : index + 1])
-                    start = -1
-        return pieces
-
-    def _glue_stream_message(
-        self, objects: list[dict[str, Any]]
-    ) -> Optional[dict[str, Any]]:
-        role = "assistant"
-        parts: list[str] = []
-        final_message: Optional[dict[str, Any]] = None
-
-        for item in objects:
-            if not isinstance(item, dict):
-                continue
-
-            message = item.get("message")
-            if isinstance(message, dict):
-                final_message = message
-
-            choices = item.get("choices")
-            if isinstance(choices, list):
-                for choice in choices:
-                    if not isinstance(choice, dict):
-                        continue
-                    embedded = choice.get("message")
-                    if isinstance(embedded, dict):
-                        return embedded
-                    delta = choice.get("delta")
-                    if isinstance(delta, dict):
-                        new_role = delta.get("role")
-                        if isinstance(new_role, str) and new_role:
-                            role = new_role
-                        chunk = self._pull_text(delta)
-                        if chunk:
-                            parts.append(chunk)
-
-            delta = item.get("delta")
-            if isinstance(delta, dict):
-                new_role = delta.get("role")
-                if isinstance(new_role, str) and new_role:
-                    role = new_role
-                chunk = self._pull_text(delta)
-                if chunk:
-                    parts.append(chunk)
-
-            response = item.get("response")
-            if isinstance(response, dict):
-                output = response.get("output")
-                if isinstance(output, list):
-                    for block in output:
-                        chunk = self._pull_text(block)
-                        if chunk:
-                            parts.append(chunk)
-
-        if final_message is not None:
-            text = self._extract_output_text(final_message)
-            if text:
-                role = final_message.get("role", role) or role
-                return {"role": role, "content": text}
-
-        if parts:
-            return {"role": role, "content": "".join(parts)}
-
-        return None
-
-    def _pull_text(self, payload: Any) -> str:
-        if isinstance(payload, dict):
-            kind = (payload.get("type") or "").lower()
-            if kind in {"reasoning", "thinking"}:
-                return ""
-            content = self._pull_text(payload.get("content"))
-            if content:
-                return content
-            text = self._pull_text(payload.get("text"))
-            if text:
-                return text
-            message = payload.get("message")
-            if isinstance(message, dict):
-                return self._extract_output_text(message)
-            return ""
-        if isinstance(payload, list):
-            pieces: list[str] = []
-            for item in payload:
-                chunk = self._pull_text(item)
-                if chunk:
-                    pieces.append(chunk)
-            return "".join(pieces)
-        if isinstance(payload, str):
-            return payload
-        return ""
 
     def _make_preview(self, raw: str, limit: int = 500) -> str:
         text = (raw or "").strip()
