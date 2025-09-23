@@ -95,6 +95,7 @@ class OpenRouterClient:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
             "X-Title": "GigaVAD dialogue summariser",
         }
         payload = {
@@ -102,6 +103,7 @@ class OpenRouterClient:
             "messages": messages,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
+            "stream": False,
         }
         model_name = self.model.lower()
         if model_name.startswith("deepseek/deepseek-r1"):
@@ -110,6 +112,8 @@ class OpenRouterClient:
 
         retry_index = 0
         attempt = 0
+        parse_retry_used = False
+        raw_dumps: list[Path] = []
 
         while True:
             attempt += 1
@@ -166,24 +170,32 @@ class OpenRouterClient:
                 ) from exc
 
             try:
-                data = resp.json()
+                data = self._load_json_response(resp)
             except ValueError as exc:
-                raw_preview = resp.text.strip()
-                max_preview = 500
-                if raw_preview:
-                    preview = raw_preview[:max_preview]
-                    if len(raw_preview) > max_preview:
-                        preview += "…"
-                else:
-                    preview = ""
-                if self.debug and preview:
+                raw_body = resp.text or ""
+                preview = self._make_preview(raw_body)
+                raw_path = self._save_raw_response(raw_body, attempt)
+                if raw_path is not None:
+                    raw_dumps.append(raw_path)
+                if self.debug:
                     print(
-                        "[OpenRouter] Ответ не в формате JSON (фрагмент):\n"
-                        f"{preview}"
+                        "[OpenRouter] Ответ не в формате JSON, попытка %d" % attempt
                     )
+                    if preview:
+                        print(preview)
+                    if raw_path is not None:
+                        print(f"[OpenRouter] Сырой ответ сохранён: {raw_path}")
+                if not parse_retry_used:
+                    parse_retry_used = True
+                    if self.debug:
+                        print("[OpenRouter] Повторяем запрос после ошибки парсинга")
+                    continue
                 message = "Не удалось распарсить JSON от OpenRouter"
                 if preview:
                     message += ". Фрагмент ответа:\n" + preview
+                if raw_dumps:
+                    saved_list = "\n".join(f"- {path}" for path in raw_dumps)
+                    message += "\nСырые ответы сохранены:\n" + saved_list
                 raise RuntimeError(message) from exc
 
             error_payload = data.get("error")
@@ -224,6 +236,211 @@ class OpenRouterClient:
             if not content:
                 raise RuntimeError("OpenRouter ответ без content")
             return content
+
+    def _load_json_response(self, resp: requests.Response) -> dict[str, Any]:
+        try:
+            data = resp.json()
+        except ValueError:
+            body = resp.text or ""
+            data = self._extract_json_from_body(body)
+            if data is None:
+                raise ValueError("Ответ OpenRouter не является JSON")
+        if isinstance(data, dict):
+            return data
+        raise ValueError("Ответ OpenRouter имеет неподдерживаемый формат")
+
+    def _extract_json_from_body(self, body: str) -> Optional[dict[str, Any]]:
+        text = (body or "").strip()
+        if not text:
+            return None
+
+        cleaned: list[str] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.startswith(("event:", "id:", "retry:")):
+                continue
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if not line or line == "[DONE]":
+                continue
+            cleaned.append(line)
+
+        payload = "\n".join(cleaned) or text
+
+        objects: list[dict[str, Any]] = []
+        for chunk in self._split_json_chunks(payload):
+            try:
+                parsed = json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                objects.append(parsed)
+
+        if not objects:
+            return None
+
+        for item in objects:
+            choices = item.get("choices")
+            if isinstance(choices, list) and choices:
+                first = choices[0]
+                if isinstance(first, dict) and isinstance(first.get("message"), dict):
+                    return item
+
+        message = self._glue_stream_message(objects)
+        if message is not None:
+            return {"choices": [{"message": message}]}
+
+        return objects[0]
+
+    def _split_json_chunks(self, text: str) -> list[str]:
+        pieces: list[str] = []
+        depth = 0
+        start = -1
+        in_string = False
+        escape = False
+        for index, char in enumerate(text):
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "{":
+                if depth == 0:
+                    start = index
+                depth += 1
+                continue
+            if char == "}":
+                if depth == 0:
+                    continue
+                depth -= 1
+                if depth == 0 and start != -1:
+                    pieces.append(text[start : index + 1])
+                    start = -1
+        return pieces
+
+    def _glue_stream_message(
+        self, objects: list[dict[str, Any]]
+    ) -> Optional[dict[str, Any]]:
+        role = "assistant"
+        parts: list[str] = []
+        final_message: Optional[dict[str, Any]] = None
+
+        for item in objects:
+            if not isinstance(item, dict):
+                continue
+
+            message = item.get("message")
+            if isinstance(message, dict):
+                final_message = message
+
+            choices = item.get("choices")
+            if isinstance(choices, list):
+                for choice in choices:
+                    if not isinstance(choice, dict):
+                        continue
+                    embedded = choice.get("message")
+                    if isinstance(embedded, dict):
+                        return embedded
+                    delta = choice.get("delta")
+                    if isinstance(delta, dict):
+                        new_role = delta.get("role")
+                        if isinstance(new_role, str) and new_role:
+                            role = new_role
+                        chunk = self._pull_text(delta)
+                        if chunk:
+                            parts.append(chunk)
+
+            delta = item.get("delta")
+            if isinstance(delta, dict):
+                new_role = delta.get("role")
+                if isinstance(new_role, str) and new_role:
+                    role = new_role
+                chunk = self._pull_text(delta)
+                if chunk:
+                    parts.append(chunk)
+
+            response = item.get("response")
+            if isinstance(response, dict):
+                output = response.get("output")
+                if isinstance(output, list):
+                    for block in output:
+                        chunk = self._pull_text(block)
+                        if chunk:
+                            parts.append(chunk)
+
+        if final_message is not None:
+            text = self._extract_output_text(final_message)
+            if text:
+                role = final_message.get("role", role) or role
+                return {"role": role, "content": text}
+
+        if parts:
+            return {"role": role, "content": "".join(parts)}
+
+        return None
+
+    def _pull_text(self, payload: Any) -> str:
+        if isinstance(payload, dict):
+            kind = (payload.get("type") or "").lower()
+            if kind in {"reasoning", "thinking"}:
+                return ""
+            content = self._pull_text(payload.get("content"))
+            if content:
+                return content
+            text = self._pull_text(payload.get("text"))
+            if text:
+                return text
+            message = payload.get("message")
+            if isinstance(message, dict):
+                return self._extract_output_text(message)
+            return ""
+        if isinstance(payload, list):
+            pieces: list[str] = []
+            for item in payload:
+                chunk = self._pull_text(item)
+                if chunk:
+                    pieces.append(chunk)
+            return "".join(pieces)
+        if isinstance(payload, str):
+            return payload
+        return ""
+
+    def _make_preview(self, raw: str, limit: int = 500) -> str:
+        text = (raw or "").strip()
+        if not text:
+            return ""
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "…"
+
+    def _save_raw_response(self, body: str, attempt: int) -> Optional[Path]:
+        if not body:
+            return None
+        directory = Path("openrouter_raw")
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = f"{timestamp}_attempt{attempt}"
+        candidate = directory / f"{base_name}.txt"
+        counter = 1
+        while candidate.exists():
+            candidate = directory / f"{base_name}_{counter}.txt"
+            counter += 1
+        try:
+            candidate.write_text(body, encoding="utf-8")
+        except OSError:
+            return None
+        return candidate
 
     def _respect_rate_limit(self) -> None:
         if self.max_requests_per_minute <= 0:
