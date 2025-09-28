@@ -4,15 +4,15 @@
 from __future__ import annotations
 
 # =============================== ГЛОБАЛЬНЫЕ НАСТРОЙКИ ===============================
-INPUT_DIALOG: str = "out\\19_09\\dialog_19_09.jsonl"              # Финальный текст диалога (dialog_*.txt)
+INPUT_DIALOG: str = "out\\26-09-2025\\dialog_26-09-2025.jsonl"              # Финальный текст диалога (dialog_*.txt)
 CHEAT_SHEET_FILE: str = "out\\19_09\\Cheat_sheet.txt"                     # Готовый cheat sheet (TXT), "" — не отправлять
-OUTPUT_TEXT: str = "out\\19_09\\summary_19_09.txt"                         # Путь для финального текста ("" — пропустить)
+OUTPUT_TEXT: str = "out\\26-09-2025\\summary_26-09-2025.txt"                         # Путь для финального текста ("" — пропустить)
 
-MODEL_NAME: str = "deepseek/deepseek-chat-v3.1:free"  # Модель OpenRouter
-CHUNK_COUNT: int = 5                           # Сколько окон по ~20%
+MODEL_NAME: str = "x-ai/grok-4-fast:free"  # Модель OpenRouter
+CHUNK_COUNT: int = 3                           # Сколько окон по ~20%
 CHUNK_OVERLAP: int = 1                         # Перекрытие окон в сегментах
 TOTAL_PASSES: int = 1                          # Первый прогон + уточнение
-MAX_TOKENS: int = 12000                         # Лимит токенов на ответ
+MAX_TOKENS: int = 20000                         # Лимит токенов на ответ
 TEMPERATURE: float = 0.3                       # Температура модели
 REQUEST_TIMEOUT: int = 60                     # Таймаут HTTP-запроса, сек
 DRY_RUN: bool = False                          # True — не звонить в OpenRouter
