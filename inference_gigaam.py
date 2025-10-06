@@ -124,20 +124,24 @@ def _format_ts(sec: float) -> str:
     ms %= 1000
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
-def _read_wav_16k_mono(path: Path, target_sr: int = 16000) -> tuple[np.ndarray, int]:
+def _read_audio_16k_mono(path: Path, target_sr: int = 16000) -> tuple[np.ndarray, int]:
+    """Read arbitrary audio (WAV/FLAC/etc.) and convert to mono 16 kHz float32."""
     try:
         data, sr = sf.read(str(path), always_2d=False)
     except Exception as e:
         print(f"[ERROR] Cannot read {path}: {e}")
         return np.array([]), target_sr
+
     if not np.issubdtype(data.dtype, np.floating):
         data = data.astype(np.float32)
     else:
         data = data.astype(np.float32, copy=False)
+
     if data.ndim == 2:
         data = data.mean(axis=1, dtype=np.float32)
     elif data.ndim > 2:
         data = data.reshape(data.shape[0], -1).mean(axis=1).astype(np.float32)
+
     if sr != target_sr:
         if resample is not None:
             data = resample(data, int(len(data) * target_sr / sr))
@@ -149,8 +153,10 @@ def _read_wav_16k_mono(path: Path, target_sr: int = 16000) -> tuple[np.ndarray, 
             x_out = np.linspace(0.0, n_in - 1.0, num=n_out, endpoint=True, dtype=np.float64)
             data = np.interp(x_out, x_in, data.astype(np.float64, copy=False)).astype(np.float32)
         sr = target_sr
+
     if not np.isfinite(data).all():
         data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
     return data, sr
 
 def _safe_transcribe(model, source, lang: Optional[str] = None):
@@ -336,8 +342,8 @@ def transcribe_file_sequential(
     # Язык жёстко
     lang = LANG or "ru"
 
-    # WAV → mono 16k
-    audio, sr = _read_wav_16k_mono(path, target_sr=16000)
+    # Audio (e.g. WAV/FLAC) → mono 16k
+    audio, sr = _read_audio_16k_mono(path, target_sr=16000)
     if len(audio) == 0:
         return "", [], []
 
@@ -391,10 +397,11 @@ def transcribe_file_sequential(
     full_text_parts: List[str] = []
     for i, ((s0, s1), seg) in enumerate(zip(chunks, segments)):
         seg_audio = audio[s0:s1]
+        seg_audio = np.clip(seg_audio, -1.0, 1.0)
 
         # Подготовка источника: всегда используем временный файл для совместимости с gigaam
         with tempfile.NamedTemporaryFile(suffix=".wav", prefix=f"{path.stem}_chunk_", dir=tmpdir, delete=False) as tmpf:
-            sf.write(tmpf, seg_audio, sr, format="WAV")
+            sf.write(tmpf, seg_audio, sr, format="WAV", subtype="PCM_16")
             wav_path = Path(tmpf.name)
         try:
             with torch.inference_mode():
