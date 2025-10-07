@@ -112,7 +112,7 @@ class OpenRouterClient:
             "stream": False,
         }
         model_name = self.model.lower()
-        if model_name.startswith("deepseek/deepseek-r1"):
+        if "deepseek-r1" in model_name:
             payload.setdefault("reasoning", {"effort": "medium"})
             payload.setdefault("include_reasoning", True)
 
