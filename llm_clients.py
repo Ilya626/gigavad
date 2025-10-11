@@ -461,6 +461,10 @@ class GeminiClient:
         timeout: int,
         dry_run: bool,
         debug: bool,
+        *,
+        thinking_mode: str = "default",
+        thinking_budget: Optional[int] = None,
+        include_thoughts: bool = False,
     ) -> None:
         self.model = model
         self.api_key = api_key
@@ -469,6 +473,9 @@ class GeminiClient:
         self.timeout = timeout
         self.dry_run = dry_run or not api_key
         self.debug = debug
+        self.thinking_mode = (thinking_mode or "default").strip().lower()
+        self.thinking_budget = thinking_budget
+        self.include_thoughts = bool(include_thoughts)
 
     def chat(self, messages: list[dict[str, Any]]) -> str:
         if self.dry_run:
@@ -483,9 +490,12 @@ class GeminiClient:
             f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
         )
         payload = self._build_payload(messages)
-        generation_config: dict[str, Any] = {"temperature": float(self.temperature)}
-        if self.max_tokens and self.max_tokens > 0:
-            generation_config["maxOutputTokens"] = int(self.max_tokens)
+        try:
+            generation_config = self._make_generation_config()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Некорректные настройки thinking для Gemini: {exc}"
+            ) from exc
         payload["generationConfig"] = generation_config
 
         if self.debug:
@@ -601,11 +611,73 @@ class GeminiClient:
                 if not isinstance(part, dict):
                     continue
                 text = part.get("text")
+                if part.get("thought"):
+                    continue
                 if isinstance(text, str) and text.strip():
                     texts.append(text.strip())
         if texts:
             return "\n".join(texts).strip()
         return ""
+
+    def _make_generation_config(self) -> dict[str, Any]:
+        config: dict[str, Any] = {"temperature": float(self.temperature)}
+        if self.max_tokens and self.max_tokens > 0:
+            config["maxOutputTokens"] = int(self.max_tokens)
+        thinking_config = self._build_thinking_config()
+        if thinking_config is not None:
+            config["thinkingConfig"] = thinking_config
+        return config
+
+    def _build_thinking_config(self) -> Optional[dict[str, Any]]:
+        mode = self.thinking_mode
+        config: dict[str, Any] = {}
+        budget: Optional[int] = None
+
+        if mode in {"off", "disable", "disabled"}:
+            budget = 0
+        elif mode in {"dynamic", "auto"}:
+            budget = -1
+        elif mode in {"fixed", "manual"}:
+            budget = self._resolve_thinking_budget()
+            if budget is None:
+                raise ValueError(
+                    "для режима fixed/manual необходимо указать thinking_budget"
+                )
+            if budget <= 0:
+                raise ValueError("thinking_budget должен быть > 0 для fixed/manual")
+        elif mode in {"default", ""}:
+            budget = self._resolve_thinking_budget()
+            if budget is not None and budget < 0 and budget != -1:
+                raise ValueError(
+                    "thinking_budget должен быть неотрицательным или -1 для dynamic"
+                )
+        else:
+            raise ValueError(
+                "неизвестный режим thinking. Используйте default, dynamic, off или fixed"
+            )
+
+        if mode not in {"default", "", "fixed", "manual"}:
+            # Modes with implicit budget values override manual budget
+            config["thinkingBudget"] = budget
+        elif budget is not None:
+            config["thinkingBudget"] = budget
+
+        if self.include_thoughts:
+            config["includeThoughts"] = True
+
+        return config or None
+
+    def _resolve_thinking_budget(self) -> Optional[int]:
+        value = self.thinking_budget
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("thinking_budget не может быть булевым значением")
+        try:
+            budget = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("thinking_budget должен быть целым числом") from exc
+        return budget
 
 
 def load_openrouter_api_key(
