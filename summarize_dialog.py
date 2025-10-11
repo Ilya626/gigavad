@@ -24,6 +24,9 @@ CONFIG_SECTION: str = "openrouter"            # Секция в конфиге O
 CONFIG_KEY: str = "api_key"                   # Ключ с API-ключом OpenRouter
 GEMINI_CONFIG_SECTION: str = "gemini"         # Секция в конфиге Gemini
 GEMINI_CONFIG_KEY: str = "api_key"            # Ключ с API-ключом Gemini
+GEMINI_THINKING_MODE: str = "dynamic"         # default, dynamic, off, fixed/manual
+GEMINI_THINKING_BUDGET: Optional[int] = None   # Токены для режима fixed или переопределения default
+GEMINI_INCLUDE_THOUGHTS: bool = False          # True — запросить summary мыслей (не включается в ответ)
 
 SYSTEM_PROMPT: str = (
     "Ты — аналитик настольных RPG-сессий. Собирай структурированные резюме,"
@@ -377,6 +380,9 @@ def build_client() -> ChatClient:
             timeout=REQUEST_TIMEOUT,
             dry_run=DRY_RUN,
             debug=DEBUG,
+            thinking_mode=GEMINI_THINKING_MODE,
+            thinking_budget=GEMINI_THINKING_BUDGET,
+            include_thoughts=GEMINI_INCLUDE_THOUGHTS,
         )
 
     raise SystemExit("Неизвестный MODEL_PROVIDER. Используйте 'openrouter' или 'gemini'.")
