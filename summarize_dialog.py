@@ -129,30 +129,88 @@ def format_chunk(chunk: dict[str, Any]) -> str:
 
 
 def make_chunks(segments: list[dict[str, Any]], chunk_count: int, overlap: int) -> list[dict[str, Any]]:
+    plan = make_chunk_plan(segments, chunk_count, overlap, total_passes=1)
+    return plan[0]
+
+
+def make_chunk_plan(
+    segments: list[dict[str, Any]],
+    chunk_count: int,
+    overlap: int,
+    total_passes: int,
+) -> list[list[dict[str, Any]]]:
     if not segments:
         raise ValueError("Нет сегментов для резюмирования")
     if chunk_count <= 0:
         raise ValueError("chunk_count должен быть > 0")
+    if total_passes <= 0:
+        raise ValueError("total_passes должен быть > 0")
+
     total = len(segments)
     chunk_size = max(1, math.ceil(total / chunk_count))
     safe_overlap = max(0, min(overlap, chunk_size - 1))
 
-    chunks: list[dict[str, Any]] = []
-    start = 0
-    idx = 0
+    offsets = _compute_chunk_offsets(total, chunk_size, total_passes)
+    plans: list[list[dict[str, Any]]] = []
+    for offset in offsets:
+        plans.append(_make_chunks_with_offset(segments, chunk_size, safe_overlap, offset))
+    return plans
 
-    while start < total:
-        end = min(total, start + chunk_size)
-        if end < total:
-            tail_speaker = segments[end - 1].get("speaker")
-            while end < total and segments[end].get("speaker") == tail_speaker:
-                end += 1
-        idx += 1
-        chunk_segments = segments[start:end]
-        chunks.append({"index": idx, "segments": chunk_segments})
-        if end >= total:
-            break
-        start = max(0, end - safe_overlap)
+
+def _compute_chunk_offsets(total: int, chunk_size: int, total_passes: int) -> list[int]:
+    if total_passes <= 0:
+        return []
+    if total <= 0:
+        return [0] * total_passes
+
+    stride = max(1, chunk_size // 2)
+    offsets: list[int] = []
+    used: set[int] = set()
+    current = 0
+    for _ in range(total_passes):
+        while current in used and len(used) < total:
+            current = (current + 1) % total
+        offsets.append(current)
+        used.add(current)
+        current = (current + stride) % total
+    return offsets
+
+
+def _make_chunks_with_offset(
+    segments: list[dict[str, Any]],
+    chunk_size: int,
+    safe_overlap: int,
+    offset: int,
+) -> list[dict[str, Any]]:
+    total = len(segments)
+    if total == 0:
+        return []
+
+    normalized_offset = offset % total
+    ranges: list[tuple[int, int]]
+    if normalized_offset == 0:
+        ranges = [(0, total)]
+    else:
+        ranges = [(normalized_offset, total), (0, normalized_offset)]
+
+    chunks: list[dict[str, Any]] = []
+    idx = 0
+    for base_start, base_end in ranges:
+        if base_start >= base_end:
+            continue
+        start = base_start
+        while start < base_end:
+            end = min(base_end, start + chunk_size)
+            if end < base_end:
+                tail_speaker = segments[end - 1].get("speaker")
+                while end < base_end and segments[end].get("speaker") == tail_speaker:
+                    end += 1
+            idx += 1
+            chunk_segments = segments[start:end]
+            chunks.append({"index": idx, "segments": chunk_segments})
+            if end >= base_end:
+                break
+            start = max(base_start, end - safe_overlap)
     return chunks
 
 
@@ -276,7 +334,12 @@ def run_pass(
 
 def summarise_dialogue(input_path: Path, client: Optional[ChatClient] = None) -> str:
     segments = load_segments(input_path)
-    chunks = make_chunks(segments, CHUNK_COUNT, CHUNK_OVERLAP)
+    chunk_plan = make_chunk_plan(
+        segments,
+        CHUNK_COUNT,
+        CHUNK_OVERLAP,
+        total_passes=max(1, TOTAL_PASSES),
+    )
 
     cheat_path = Path(CHEAT_SHEET_FILE).expanduser().resolve() if CHEAT_SHEET_FILE else None
     cheat_sheet = load_cheat_sheet(cheat_path) if cheat_path else ""
@@ -309,6 +372,10 @@ def summarise_dialogue(input_path: Path, client: Optional[ChatClient] = None) ->
                 )
 
     for pass_index in range(TOTAL_PASSES):
+        if pass_index < len(chunk_plan):
+            chunks = chunk_plan[pass_index]
+        else:
+            chunks = chunk_plan[-1]
         try:
             running_summary = run_pass(
                 client=client,
