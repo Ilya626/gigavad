@@ -27,6 +27,7 @@ GEMINI_CONFIG_KEY: str = "api_key"            # Ключ с API-ключом Gem
 GEMINI_THINKING_MODE: str = "dynamic"         # default, dynamic, off, fixed/manual
 GEMINI_THINKING_BUDGET: Optional[int] = None   # Токены для режима fixed или переопределения default
 GEMINI_INCLUDE_THOUGHTS: bool = False          # True — запросить summary мыслей (не включается в ответ)
+GEMINI_REQUESTS_PER_MINUTE: Optional[int] = None  # None — авто по названию модели
 
 SYSTEM_PROMPT: str = (
     "Ты — аналитик настольных RPG-сессий. Собирай структурированные резюме,"
@@ -372,6 +373,9 @@ def build_client() -> ChatClient:
             key=GEMINI_CONFIG_KEY,
             debug=DEBUG,
         )
+        requests_per_minute = GEMINI_REQUESTS_PER_MINUTE
+        if requests_per_minute is None:
+            requests_per_minute = _auto_gemini_rpm(MODEL_NAME)
         return GeminiClient(
             model=MODEL_NAME,
             api_key=api_key,
@@ -383,9 +387,19 @@ def build_client() -> ChatClient:
             thinking_mode=GEMINI_THINKING_MODE,
             thinking_budget=GEMINI_THINKING_BUDGET,
             include_thoughts=GEMINI_INCLUDE_THOUGHTS,
+            max_requests_per_minute=requests_per_minute,
         )
 
     raise SystemExit("Неизвестный MODEL_PROVIDER. Используйте 'openrouter' или 'gemini'.")
+
+
+def _auto_gemini_rpm(model_name: str) -> int:
+    name = (model_name or "").strip().lower()
+    if "flash" in name:
+        return 5
+    if "pro" in name:
+        return 2
+    return 2
 
 
 def _save_partial_summary(input_path: Path, summary: str) -> Optional[Path]:
