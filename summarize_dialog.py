@@ -297,7 +297,7 @@ def run_pass(
                 chunk_number = int(str(raw_index))
             except (TypeError, ValueError):
                 chunk_number = None
-        previous_summary = "\n\n".join(summary_history).strip()
+        previous_summary = summary_history[-1].strip() if summary_history else ""
         composed = compose_messages(
             cheat_sheet=cheat_sheet,
             chunk=chunk,
@@ -306,11 +306,13 @@ def run_pass(
             total_passes=total_passes,
         )
         conversation: list[dict[str, Any]] = []
-        for past_summary in summary_history:
+        if summary_history:
             conversation.append(
                 {
                     "role": "assistant",
-                    "content": [{"type": "text", "text": past_summary}],
+                    "content": [
+                        {"type": "text", "text": summary_history[-1]}
+                    ],
                 }
             )
         conversation.extend(composed)
