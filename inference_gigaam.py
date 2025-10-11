@@ -29,6 +29,7 @@ SILERO_MIN_SPEECH_MS: int = 100              # Мин. длительность 
 SILERO_MIN_SILENCE_MS: int = 200             # Мин. пауза между речью, мс
 SILERO_SPEECH_PAD_MS: int = 100              # Паддинг вокруг речи, мс
 SILERO_CUDA: bool = True                     # Гонять Silero на CUDA (если есть)
+SILERO_FORCE_CUDA_WITH_GIGAAM: bool = False  # True: силой держать Silero на CUDA даже при занятости GPU моделью распознавания
 SILERO_MODEL_DIR: str = ""                   # Кастомная директория модели (опц.)
 
 # Постобработка VAD
@@ -183,6 +184,34 @@ def _is_dense(text: str, dur: float, min_wps: float = 1.0, min_cps: float = 3.0)
     wps = len(text.split()) / max(dur, 1e-9)
     cps = len(text) / max(dur, 1e-9)
     return (wps >= min_wps) or (cps >= min_cps)
+
+
+def _model_uses_cuda(model) -> bool:
+    """Return True if any part of the model is resident on CUDA."""
+    if not torch.cuda.is_available():
+        return False
+
+    try:
+        device = getattr(model, "device", None)
+        if isinstance(device, torch.device):
+            if device.type == "cuda":
+                return True
+    except Exception:
+        pass
+
+    for attr in ("parameters", "buffers"):
+        try:
+            iterator = getattr(model, attr)
+        except AttributeError:
+            continue
+        try:
+            for tensor in iterator():
+                if getattr(tensor, "is_cuda", False):
+                    return True
+        except Exception:
+            continue
+
+    return False
 
 
 # ------------------------- VAD → чанки (без резки!) -------------------------
@@ -553,6 +582,20 @@ def main():
     if not input_path.is_dir():
         raise SystemExit(f"[ERROR] Input must be a directory, got: {INPUT}")
 
+    model = gigaam.load_model(MODEL_NAME)
+    if hasattr(model, "eval"):
+        model.eval()
+    try:
+        if torch.cuda.is_available():
+            if hasattr(model, "to"):
+                model = model.to("cuda")
+            elif hasattr(model, "cuda"):
+                model = model.cuda()
+    except Exception:
+        pass
+
+    model_uses_cuda = _model_uses_cuda(model)
+
     # VAD конфиг (общий для всех)
     vad_cfg = VadConfig(
         silero=SileroParams(
@@ -575,6 +618,15 @@ def main():
         ),
     )
 
+    if (
+        model_uses_cuda
+        and vad_cfg.silero.use_cuda
+        and not SILERO_FORCE_CUDA_WITH_GIGAAM
+    ):
+        if DEBUG:
+            print("[DEBUG] GigaAM is on CUDA; keeping Silero VAD on CPU to free GPU memory")
+        vad_cfg.silero.use_cuda = False
+
     vad_processor = VADProcessor(
         threshold=vad_cfg.silero.threshold,
         min_speech_ms=vad_cfg.silero.min_speech_ms,
@@ -585,18 +637,6 @@ def main():
         use_cuda=(vad_cfg.silero.use_cuda and torch.cuda.is_available()),
         model_dir=vad_cfg.silero.model_dir,
     )
-
-    model = gigaam.load_model(MODEL_NAME)
-    if hasattr(model, "eval"):
-        model.eval()
-    try:
-        if torch.cuda.is_available():
-            if hasattr(model, "to"):
-                model = model.to("cuda")
-            elif hasattr(model, "cuda"):
-                model = model.cuda()
-    except Exception:
-        pass
 
     out_base = Path(OUTPUT).parent
     report_base = Path(OUTPUT_REPORT).parent
