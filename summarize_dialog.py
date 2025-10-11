@@ -10,10 +10,10 @@ OUTPUT_TEXT: str = "out\\2025-05-25\\summary_2025-05-25.txt"                    
 
 MODEL_PROVIDER: str = "gemini"               # "openrouter" или "gemini"
 MODEL_NAME: str = "gemini-flash-latest"  # Имя модели выбранного провайдера
-CHUNK_COUNT: int = 3                           # Сколько окон по ~20%
+CHUNK_COUNT: int = 5                           # Сколько окон по ~20%
 CHUNK_OVERLAP: int = 1                         # Перекрытие окон в сегментах
 TOTAL_PASSES: int = 1                          # Первый прогон + уточнение
-MAX_TOKENS: int = 6000                         # Лимит токенов на ответ
+MAX_TOKENS: int = 10000                         # Лимит токенов на ответ
 TEMPERATURE: float = 0.3                       # Температура модели
 REQUEST_TIMEOUT: int = 60                     # Таймаут HTTP-запроса, сек
 DRY_RUN: bool = False                          # True — не звонить в OpenRouter
