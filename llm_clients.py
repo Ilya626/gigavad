@@ -462,7 +462,7 @@ class GeminiClient:
         dry_run: bool,
         debug: bool,
         *,
-        thinking_mode: str = "default",
+        thinking_mode: str = "dynamic",
         thinking_budget: Optional[int] = None,
         include_thoughts: bool = False,
     ) -> None:
@@ -473,7 +473,7 @@ class GeminiClient:
         self.timeout = timeout
         self.dry_run = dry_run or not api_key
         self.debug = debug
-        self.thinking_mode = (thinking_mode or "default").strip().lower()
+        self.thinking_mode = (thinking_mode or "dynamic").strip().lower()
         self.thinking_budget = thinking_budget
         self.include_thoughts = bool(include_thoughts)
 

@@ -24,7 +24,7 @@ CONFIG_SECTION: str = "openrouter"            # Секция в конфиге O
 CONFIG_KEY: str = "api_key"                   # Ключ с API-ключом OpenRouter
 GEMINI_CONFIG_SECTION: str = "gemini"         # Секция в конфиге Gemini
 GEMINI_CONFIG_KEY: str = "api_key"            # Ключ с API-ключом Gemini
-GEMINI_THINKING_MODE: str = "default"         # default, dynamic, off, fixed/manual
+GEMINI_THINKING_MODE: str = "dynamic"         # default, dynamic, off, fixed/manual
 GEMINI_THINKING_BUDGET: Optional[int] = None   # Токены для режима fixed или переопределения default
 GEMINI_INCLUDE_THOUGHTS: bool = False          # True — запросить summary мыслей (не включается в ответ)
 
