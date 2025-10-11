@@ -465,6 +465,7 @@ class GeminiClient:
         thinking_mode: str = "dynamic",
         thinking_budget: Optional[int] = None,
         include_thoughts: bool = False,
+        max_requests_per_minute: Optional[int] = None,
     ) -> None:
         self.model = model
         self.api_key = api_key
@@ -476,6 +477,16 @@ class GeminiClient:
         self.thinking_mode = (thinking_mode or "dynamic").strip().lower()
         self.thinking_budget = thinking_budget
         self.include_thoughts = bool(include_thoughts)
+        if max_requests_per_minute is None:
+            self.max_requests_per_minute = 0
+        else:
+            try:
+                self.max_requests_per_minute = int(max_requests_per_minute)
+            except (TypeError, ValueError):
+                self.max_requests_per_minute = 0
+            if self.max_requests_per_minute < 0:
+                self.max_requests_per_minute = 0
+        self._recent_requests: deque[float] = deque()
 
     def chat(self, messages: list[dict[str, Any]]) -> str:
         if self.dry_run:
@@ -504,6 +515,7 @@ class GeminiClient:
             )
 
         try:
+            self._respect_rate_limit()
             resp = requests.post(
                 url,
                 params={"key": self.api_key},
@@ -618,6 +630,29 @@ class GeminiClient:
         if texts:
             return "\n".join(texts).strip()
         return ""
+
+    def _respect_rate_limit(self) -> None:
+        if self.max_requests_per_minute <= 0:
+            return
+        window = 60.0
+        queue = self._recent_requests
+        while True:
+            now = time.monotonic()
+            while queue and now - queue[0] > window:
+                queue.popleft()
+            if len(queue) < self.max_requests_per_minute:
+                queue.append(now)
+                return
+            wait_time = window - (now - queue[0])
+            if wait_time <= 0:
+                queue.append(now)
+                return
+            if self.debug:
+                print(
+                    "[Gemini] Достигнут локальный лимит %d req/min, ждём %.1f с"
+                    % (self.max_requests_per_minute, wait_time)
+                )
+            time.sleep(wait_time)
 
     def _make_generation_config(self) -> dict[str, Any]:
         config: dict[str, Any] = {"temperature": float(self.temperature)}
