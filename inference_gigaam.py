@@ -128,7 +128,7 @@ def _format_ts(sec: float) -> str:
 def _read_audio_16k_mono(path: Path, target_sr: int = 16000) -> tuple[np.ndarray, int]:
     """Read arbitrary audio (WAV/FLAC/etc.) and convert to mono 16 kHz float32."""
     try:
-        data, sr = sf.read(str(path), always_2d=False)
+        data, sr = sf.read(str(path), always_2d=False, dtype="float32")
     except Exception as e:
         print(f"[ERROR] Cannot read {path}: {e}")
         return np.array([]), target_sr
@@ -177,6 +177,52 @@ def _safe_transcribe(model, source, lang: Optional[str] = None):
         except Exception:
             kwargs = {}
     return fn(source, **kwargs)
+
+
+def _patch_gigaam_load_audio(debug: bool = False) -> None:
+    """Replace gigaam.load_audio with a pure Python variant to avoid ffmpeg crashes."""
+
+    if gigaam is None:
+        return
+
+    try:
+        from gigaam import preprocess as _gigaam_preprocess  # type: ignore
+    except Exception as exc:  # pragma: no cover - defensive, module may be absent
+        if debug:
+            print(f"[DEBUG] Cannot patch gigaam preprocess.load_audio: {exc}")
+        _gigaam_preprocess = None  # type: ignore
+
+    try:
+        from gigaam import model as _gigaam_model  # type: ignore
+    except Exception as exc:  # pragma: no cover - defensive
+        if debug:
+            print(f"[DEBUG] Cannot patch gigaam model.load_audio: {exc}")
+        _gigaam_model = None  # type: ignore
+
+    if _gigaam_preprocess is None and _gigaam_model is None:
+        return
+
+    def _load_audio_no_ffmpeg(
+        audio_path: str,
+        sample_rate: int = getattr(_gigaam_model, "SAMPLE_RATE", 16000),
+        return_format: str = "float",
+    ):
+        data, _sr = _read_audio_16k_mono(Path(audio_path), target_sr=sample_rate)
+        if data.size == 0:
+            raise RuntimeError(f"Failed to load audio from {audio_path}")
+
+        if return_format == "float":
+            return torch.from_numpy(np.ascontiguousarray(data, dtype=np.float32))
+        if return_format == "int":
+            scaled = np.clip(np.rint(data * 32768.0), -32768, 32767).astype(np.int16)
+            return torch.from_numpy(np.ascontiguousarray(scaled))
+        raise ValueError(f"Unsupported return_format: {return_format}")
+
+    if _gigaam_preprocess is not None:
+        _gigaam_preprocess.load_audio = _load_audio_no_ffmpeg  # type: ignore
+    if _gigaam_model is not None:
+        _gigaam_model.load_audio = _load_audio_no_ffmpeg  # type: ignore
+
 
 def _is_dense(text: str, dur: float, min_wps: float = 1.0, min_cps: float = 3.0) -> bool:
     if not text:
@@ -577,6 +623,8 @@ def main():
             "pip install gigaam  (или git+https://github.com/salute-developers/GigaAM)\n"
             f"Import error: {_IMPORT_ERR}"
         )
+
+    _patch_gigaam_load_audio(debug=bool(DEBUG))
 
     input_path = Path(INPUT).resolve()
     if not input_path.is_dir():
