@@ -4,16 +4,16 @@
 from __future__ import annotations
 
 # =============================== ГЛОБАЛЬНЫЕ НАСТРОЙКИ ===============================
-INPUT_DIALOG: str = "out\\2025-05-25\\dialog_2025-05-25.jsonl"              # Финальный текст диалога (dialog_*.txt)
+INPUT_DIALOG: str = "out\\2025-10-23\\dialog_2025-10-23.jsonl"              # Финальный текст диалога (dialog_*.txt)
 CHEAT_SHEET_FILE: str = "out\\Cheatsheet.txt"                     # Готовый cheat sheet (TXT), "" — не отправлять
-OUTPUT_TEXT: str = "out\\2025-05-25\\summary_2025-05-25.txt"                         # Путь для финального текста ("" — пропустить)
+OUTPUT_TEXT: str = "out\\2025-10-23\\summary_dialog_2025-10-23.txt"                         # Путь для финального текста ("" — пропустить)
 
 MODEL_PROVIDER: str = "gemini"               # "openrouter" или "gemini"
 MODEL_NAME: str = "gemini-2.5-pro"  # Имя модели выбранного провайдера
-CHUNK_COUNT: int = 4                           # Сколько окон по ~20%
+CHUNK_COUNT: int = 5                           # Сколько окон по ~20%
 CHUNK_OVERLAP: int = 1                         # Перекрытие окон в сегментах
-TOTAL_PASSES: int = 1                          # Первый прогон + уточнение
-MAX_TOKENS: int = 10000                         # Лимит токенов на ответ
+TOTAL_PASSES: int = 2                          # Первый прогон + уточнение
+MAX_TOKENS: int = 20000                         # Лимит токенов на ответ
 TEMPERATURE: float = 0.5                       # Температура модели
 REQUEST_TIMEOUT: int = 210                     # Таймаут HTTP-запроса, сек
 DRY_RUN: bool = False                          # True — не звонить в OpenRouter
@@ -28,6 +28,11 @@ GEMINI_THINKING_MODE: str = "dynamic"         # default, dynamic, off, fixed/man
 GEMINI_THINKING_BUDGET: Optional[int] = None   # Токены для режима fixed или переопределения default
 GEMINI_INCLUDE_THOUGHTS: bool = False          # True — запросить summary мыслей (не включается в ответ)
 GEMINI_REQUESTS_PER_MINUTE: Optional[int] = None  # None — авто по названию модели
+AUTO_CHUNK_COUNT: bool = True
+TARGET_CHUNK_TOKENS: int = 17000
+MAX_CHUNK_TOKENS: int = 18000
+TOKEN_ENCODING: str = "cl100k_base"
+
 
 SYSTEM_PROMPT: str = (
 " Вы — летописец и хронист, ведущий подробный и структурированный лог игровой сессии (или главы). Ваша задача — создать подробный, объективный и насыщенный информацией пересказ, ориентированный на ключевые сюжетные повороты, развитие персонажей, магические события и дипломатические договорённости." 
@@ -57,12 +62,21 @@ USER_GUIDE: str = (
 )
 
 PASS_LABELS: tuple[str, ...] = ("Первый проход", "Уточнение")
+SECOND_PASS_SYSTEM_PROMPT: str = (
+    "Ты должен уточнить и добавить детали резюме. "
+    "Ты получаешь полное резюме и отдельный фрагмент исходного разговора № {fragment_label}. "
+    "Твоя задача — дополнить резюме деталями из фрагмента, сохраняя структуру, "
+    "точность формулировок и важные нюансы."
+)
+FINAL_RECHECK_MESSAGE: str = "ПРОВЕРЬ ЧТО ДАННОЕ РЕЗЮМЕ ОТФОРМАТИРОВАНО СОГЛАСНО ЗАДАЧЕ"
+
 # ====================================================================================
 
 import math
 import json
 from pathlib import Path
 from typing import Any, Callable, Optional
+from chunk_utils import estimate_chunk_count_from_segments
 
 from llm_clients import (
     ChatClient,
@@ -229,6 +243,8 @@ def compose_messages(
     previous_summary: Optional[str],
     pass_index: int,
     total_passes: int,
+    system_prompt: str,
+    chunk_total: int,
 ) -> list[dict[str, Any]]:
     if pass_index < len(PASS_LABELS):
         pass_label = PASS_LABELS[pass_index]
@@ -245,24 +261,82 @@ def compose_messages(
     else:
         blocks.append("### Актуальное резюме\n(пусто — начни конспект)")
 
-    blocks.append(f"### Фрагмент #{chunk['index']}\n" + format_chunk(chunk))
+    try:
+        fragment_index = int(chunk.get("index") or 1)
+    except (TypeError, ValueError):
+        fragment_index = 1
+    try:
+        total_fragments = int(chunk_total)
+    except (TypeError, ValueError):
+        total_fragments = 0
+    total_fragments = max(1, total_fragments)
+    fragment_label = f"{fragment_index}/{total_fragments}"
+    blocks.append(f"### Фрагмент {fragment_label}\n" + format_chunk(chunk))
     blocks.append(USER_GUIDE.strip())
 
     user_payload = {"type": "text", "text": "\n\n".join(blocks)}
-    system_prompt = SYSTEM_PROMPT.strip()
+    resolved_system_prompt = (system_prompt or "").strip()
+    if "{fragment_label" in resolved_system_prompt:
+        try:
+            resolved_system_prompt = resolved_system_prompt.format(fragment_label=fragment_label)
+        except KeyError:
+            pass
 
-    if INCLUDE_SYSTEM_PROMPT and system_prompt:
+    if INCLUDE_SYSTEM_PROMPT and resolved_system_prompt:
         return [
-            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+            {"role": "system", "content": [{"type": "text", "text": resolved_system_prompt}]},
             {"role": "user", "content": [user_payload]},
         ]
 
     content_blocks: list[dict[str, str]] = []
-    if system_prompt:
-        content_blocks.append({"type": "text", "text": f"{system_prompt}\n\n"})
+    if resolved_system_prompt:
+        content_blocks.append({"type": "text", "text": f"{resolved_system_prompt}\n\n"})
     content_blocks.append(user_payload)
     return [{"role": "user", "content": content_blocks}]
 
+
+
+def _finalise_summary(
+    client: ChatClient,
+    summary: str,
+    system_prompt: str,
+) -> str:
+    summary = (summary or "").strip()
+    if not summary:
+        return summary
+
+    combined_system = (system_prompt or "").strip()
+    if combined_system:
+        combined_system = "{}\n\n{}".format(combined_system, FINAL_RECHECK_MESSAGE)
+    else:
+        combined_system = FINAL_RECHECK_MESSAGE
+
+    conversation: list[dict[str, Any]] = []
+    if INCLUDE_SYSTEM_PROMPT and combined_system:
+        conversation.append(
+            {"role": "system", "content": [{"type": "text", "text": combined_system}]}
+        )
+        conversation.append(
+            {"role": "user", "content": [{"type": "text", "text": summary}]}
+        )
+    else:
+        user_blocks: list[dict[str, str]] = []
+        if combined_system:
+            user_blocks.append({"type": "text", "text": combined_system + "\n\n"})
+        user_blocks.append({"type": "text", "text": summary})
+        conversation.append({"role": "user", "content": user_blocks})
+
+    try:
+        response = client.chat(conversation)
+    except OpenRouterRateLimitError:
+        raise
+    except Exception as exc:
+        if DEBUG:
+            print(f"[Summariser] Final check skipped due to error: {exc}")
+        return summary
+
+    cleaned = (response or "").strip()
+    return cleaned or summary
 
 def run_pass(
     client: ChatClient,
@@ -271,6 +345,7 @@ def run_pass(
     initial_summary: Optional[str],
     pass_index: int,
     total_passes: int,
+    system_prompt: str,
     progress_callback: Optional[Callable[[str, Optional[int], int], None]] = None,
 ) -> str:
     summary_history: list[str] = []
@@ -279,6 +354,9 @@ def run_pass(
         if cleaned_initial:
             summary_history.append(cleaned_initial)
     running_summary = initial_summary
+    chunk_total = len(chunks) if chunks else 0
+    if chunk_total <= 0:
+        chunk_total = 1
 
     def emit_progress(text: Optional[str], chunk_no: Optional[int]) -> None:
         if progress_callback is None:
@@ -304,6 +382,8 @@ def run_pass(
             previous_summary=previous_summary or None,
             pass_index=pass_index,
             total_passes=total_passes,
+            system_prompt=system_prompt,
+            chunk_total=chunk_total,
         )
         conversation: list[dict[str, Any]] = []
         if summary_history:
@@ -326,6 +406,7 @@ def run_pass(
         except Exception:
             emit_progress(running_summary, chunk_number)
             raise
+
         running_summary = response
         cleaned = (response or "").strip()
         if cleaned:
@@ -333,15 +414,41 @@ def run_pass(
             emit_progress(cleaned, chunk_number)
     return running_summary or ""
 
-
 def summarise_dialogue(input_path: Path, client: Optional[ChatClient] = None) -> str:
+    chunk_count = CHUNK_COUNT
     segments = load_segments(input_path)
-    chunk_plan = make_chunk_plan(
-        segments,
-        CHUNK_COUNT,
-        CHUNK_OVERLAP,
-        total_passes=max(1, TOTAL_PASSES),
-    )
+    if AUTO_CHUNK_COUNT:
+        try:
+            auto_count = estimate_chunk_count_from_segments(
+                segments,
+                target_chunk_tokens=TARGET_CHUNK_TOKENS,
+                max_chunk_tokens=MAX_CHUNK_TOKENS,
+                encoding_name=TOKEN_ENCODING,
+            )
+            chunk_count = max(1, int(auto_count))
+            if DEBUG:
+                print(f"[Summariser] Auto chunk count: {chunk_count}")
+        except Exception as exc:
+            if DEBUG:
+                print(f"[Summariser] Auto chunk sizing failed: {exc}")
+            chunk_count = max(1, CHUNK_COUNT)
+    else:
+        chunk_count = max(1, CHUNK_COUNT)
+
+    base_chunks = make_chunks(segments, chunk_count, CHUNK_OVERLAP)
+    chunk_plan: list[list[dict[str, Any]]] = [base_chunks]
+    pass_prompts: list[str] = [SYSTEM_PROMPT]
+
+    if TOTAL_PASSES >= 2:
+        second_fragment_count = max(1, math.ceil(max(1, len(base_chunks)) / 2))
+        second_chunks = make_chunks(segments, second_fragment_count, CHUNK_OVERLAP)
+        chunk_plan.append(second_chunks)
+        pass_prompts.append(SECOND_PASS_SYSTEM_PROMPT)
+
+    while len(chunk_plan) < TOTAL_PASSES:
+        chunk_plan.append(chunk_plan[-1])
+    while len(pass_prompts) < TOTAL_PASSES:
+        pass_prompts.append(pass_prompts[-1])
 
     cheat_path = Path(CHEAT_SHEET_FILE).expanduser().resolve() if CHEAT_SHEET_FILE else None
     cheat_sheet = load_cheat_sheet(cheat_path) if cheat_path else ""
@@ -378,6 +485,10 @@ def summarise_dialogue(input_path: Path, client: Optional[ChatClient] = None) ->
             chunks = chunk_plan[pass_index]
         else:
             chunks = chunk_plan[-1]
+        if pass_index < len(pass_prompts):
+            current_prompt = pass_prompts[pass_index]
+        else:
+            current_prompt = pass_prompts[-1]
         try:
             running_summary = run_pass(
                 client=client,
@@ -386,6 +497,7 @@ def summarise_dialogue(input_path: Path, client: Optional[ChatClient] = None) ->
                 initial_summary=running_summary,
                 pass_index=pass_index,
                 total_passes=TOTAL_PASSES,
+                system_prompt=current_prompt,
                 progress_callback=handle_progress,
             )
         except OpenRouterRateLimitError as exc:
@@ -416,6 +528,20 @@ def summarise_dialogue(input_path: Path, client: Optional[ChatClient] = None) ->
                     f"[Summariser] Используем ранее сохранённый прогресс: {last_saved_path}"
                 )
             raise
+    final_output = (running_summary or "").strip()
+    if final_output:
+        base_prompt = pass_prompts[0] if pass_prompts else SYSTEM_PROMPT
+        try:
+            running_summary = _finalise_summary(client, final_output, base_prompt)
+        except OpenRouterRateLimitError:
+            raise
+        except Exception as exc:
+            if DEBUG:
+                print(f"[Summariser] Final check skipped due to error: {exc}")
+            running_summary = final_output
+    else:
+        running_summary = final_output
+
     return running_summary or ""
 
 
