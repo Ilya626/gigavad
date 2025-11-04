@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 # =============================== ГЛОБАЛЬНЫЕ НАСТРОЙКИ ===============================
-INPUT_DIALOG: str = "out\\2025-10-23\\dialog_2025-10-23.jsonl"              # Финальный текст диалога (dialog_*.txt)
+INPUT_DIALOG: str = "out\\2025-10-31_2\\dialog_2025-10-31_2.jsonl"              # Финальный текст диалога (dialog_*.txt)
 CHEAT_SHEET_FILE: str = "out\\Cheatsheet.txt"                     # Готовый cheat sheet (TXT), "" — не отправлять
-OUTPUT_TEXT: str = "out\\2025-10-23\\summary_dialog_2025-10-23.txt"                         # Путь для финального текста ("" — пропустить)
+OUTPUT_TEXT: str = "out\\2025-10-31_2\\summary_dialog_2025-10-31_2.txt"                         # Путь для финального текста ("" — пропустить)
 
 MODEL_PROVIDER: str = "gemini"               # "openrouter" или "gemini"
 MODEL_NAME: str = "gemini-2.5-pro"  # Имя модели выбранного провайдера
@@ -599,8 +599,8 @@ def _auto_gemini_rpm(model_name: str) -> int:
     if "flash" in name:
         return 5
     if "pro" in name:
-        return 2
-    return 2
+        return 1
+    return 1
 
 
 def _save_partial_summary(input_path: Path, summary: str) -> Optional[Path]:
