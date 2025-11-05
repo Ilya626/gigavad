@@ -206,6 +206,23 @@ class GeminiClient(_MessageUtils):
                 time.sleep(delay)
                 continue
 
+            if resp.status_code == 503:
+                delays = (60, 180, 300)
+                delay = delays[min(len(delays) - 1, max(0, attempt - 1))]
+                if self.debug:
+                    print(
+                        f"[Gemini] 503 Service Unavailable. Waiting {delay / 60:.1f} min "
+                        f"before retry ({attempt}/{attempts})"
+                    )
+                time.sleep(delay)
+                if attempt >= attempts:
+                    text_body = resp.text.strip()
+                    details = f" {text_body}" if text_body else ""
+                    raise RuntimeError(
+                        f"Gemini service unavailable (503).{details}"
+                    )
+                continue
+
             if 500 <= resp.status_code < 600:
                 text_body = resp.text.strip()
                 details = f" {text_body}" if text_body else ""
@@ -541,6 +558,23 @@ class OpenRouterClient(_MessageUtils):
                 if retry_after is not None:
                     error.retry_after = retry_after  # type: ignore[attr-defined]
                 raise error
+
+            if resp.status_code == 503:
+                delays = (60, 180, 300)
+                delay = delays[min(len(delays) - 1, max(0, attempt - 1))]
+                if self.debug:
+                    print(
+                        f"[OpenRouter] 503 Service Unavailable. Waiting {delay / 60:.1f} min "
+                        f"before retry ({attempt}/{attempts})"
+                    )
+                time.sleep(delay)
+                if attempt >= attempts:
+                    text_body = resp.text.strip()
+                    details = f" {text_body}" if text_body else ""
+                    raise RuntimeError(
+                        f"OpenRouter service unavailable (503).{details}"
+                    )
+                continue
 
             if 500 <= resp.status_code < 600:
                 text_body = resp.text.strip()

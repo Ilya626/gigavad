@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 # =============================== ГЛОБАЛЬНЫЕ НАСТРОЙКИ ===============================
-INPUT_DIALOG: str = "out\\2025-10-31_2\\dialog_2025-10-31_2.jsonl"              # Финальный текст диалога (dialog_*.txt)
+INPUT_DIALOG: str = "out\\2025-10-31_1\\dialog_2025-10-31_1.jsonl"              # Финальный текст диалога (dialog_*.txt)
 CHEAT_SHEET_FILE: str = "out\\Cheatsheet.txt"                     # Готовый cheat sheet (TXT), "" — не отправлять
-OUTPUT_TEXT: str = "out\\2025-10-31_2\\summary_dialog_2025-10-31_2.txt"                         # Путь для финального текста ("" — пропустить)
+OUTPUT_TEXT: str = "out\\2025-10-31_1\\summary_dialog_2025-10-31_1.txt"                         # Путь для финального текста ("" — пропустить)
 
 MODEL_PROVIDER: str = "gemini"               # "openrouter" или "gemini"
 MODEL_NAME: str = "gemini-2.5-pro"  # Имя модели выбранного провайдера
@@ -346,6 +346,7 @@ def run_pass(
     pass_index: int,
     total_passes: int,
     system_prompt: str,
+    start_chunk: Optional[int] = None,
     progress_callback: Optional[Callable[[str, Optional[int], int], None]] = None,
 ) -> str:
     summary_history: list[str] = []
@@ -375,6 +376,12 @@ def run_pass(
                 chunk_number = int(str(raw_index))
             except (TypeError, ValueError):
                 chunk_number = None
+        if (
+            start_chunk is not None
+            and isinstance(chunk_number, int)
+            and chunk_number <= start_chunk
+        ):
+            continue
         previous_summary = summary_history[-1].strip() if summary_history else ""
         composed = compose_messages(
             cheat_sheet=cheat_sheet,
@@ -456,31 +463,82 @@ def summarise_dialogue(input_path: Path, client: Optional[ChatClient] = None) ->
     if client is None:
         client = build_client()
 
-    running_summary: Optional[str] = None
-    last_saved_summary = ""
-    last_saved_path: Optional[Path] = None
+    resume_state = _load_resume_state(input_path)
+    resume_pass: Optional[int] = None
+    resume_chunk: Optional[int] = None
+    resume_summary: Optional[str] = None
+    resume_path: Optional[Path] = None
+    if isinstance(resume_state, dict) and resume_state:
+        raw_pass = resume_state.get("pass_index")
+        raw_chunk = resume_state.get("chunk_index")
+        raw_summary = (resume_state.get("summary") or "").strip()
+        raw_path = (resume_state.get("summary_path") or "").strip()
+        if isinstance(raw_pass, int) and raw_pass >= 0:
+            resume_pass = raw_pass
+        if isinstance(raw_chunk, int) and raw_chunk >= 0:
+            resume_chunk = raw_chunk
+        if raw_summary:
+            resume_summary = raw_summary
+        if raw_path:
+            resume_path = Path(raw_path).expanduser()
+        if DEBUG and resume_summary:
+            chunk_note = (
+                f", фрагмент {resume_chunk}"
+                if isinstance(resume_chunk, int) and resume_chunk > 0
+                else ""
+            )
+            print(
+                "[Summariser] Найдено сохранённое состояние (проход %d%s)."
+                % ((resume_pass or 0) + 1, chunk_note)
+            )
+
+    running_summary: Optional[str] = resume_summary
+    last_saved_summary = resume_summary or ""
+    last_saved_path: Optional[Path] = resume_path
+    last_saved_chunk: Optional[int] = resume_chunk
+    last_saved_pass: Optional[int] = resume_pass
+
+    start_pass = 0
+    if (
+        resume_summary
+        and isinstance(resume_pass, int)
+        and 0 <= resume_pass < TOTAL_PASSES
+    ):
+        start_pass = resume_pass
+    resume_pass_marker = resume_pass if resume_summary else None
+    resume_chunk_marker = resume_chunk if resume_summary else None
 
     def handle_progress(summary: str, chunk_index: Optional[int], pass_no: int) -> None:
-        nonlocal last_saved_summary, last_saved_path
+        nonlocal last_saved_summary, last_saved_path, last_saved_chunk, last_saved_pass
         trimmed = (summary or "").strip()
         if not trimmed or trimmed == last_saved_summary:
             return
         path = _save_partial_summary(input_path, trimmed)
-        last_saved_summary = trimmed
         if path is not None:
             last_saved_path = path
-            if DEBUG:
-                chunk_note = (
-                    f", фрагмент {chunk_index}"
-                    if isinstance(chunk_index, int) and chunk_index > 0
-                    else ""
-                )
-                print(
-                    "[Summariser] Промежуточный результат сохранён (проход %d%s): %s"
-                    % (pass_no + 1, chunk_note, path)
-                )
+        if isinstance(chunk_index, int):
+            last_saved_chunk = chunk_index
+        last_saved_pass = pass_no
+        last_saved_summary = trimmed
+        _store_resume_state(
+            input_path,
+            last_saved_summary,
+            last_saved_pass,
+            last_saved_chunk,
+            last_saved_path,
+        )
+        if DEBUG:
+            chunk_note = (
+                f", фрагмент {chunk_index}"
+                if isinstance(chunk_index, int) and chunk_index > 0
+                else ""
+            )
+            print(
+                "[Summariser] Промежуточный результат сохранён (проход %d%s): %s"
+                % (pass_no + 1, chunk_note, last_saved_path)
+            )
 
-    for pass_index in range(TOTAL_PASSES):
+    for pass_index in range(start_pass, TOTAL_PASSES):
         if pass_index < len(chunk_plan):
             chunks = chunk_plan[pass_index]
         else:
@@ -489,6 +547,9 @@ def summarise_dialogue(input_path: Path, client: Optional[ChatClient] = None) ->
             current_prompt = pass_prompts[pass_index]
         else:
             current_prompt = pass_prompts[-1]
+        start_chunk = (
+            resume_chunk_marker if resume_pass_marker == pass_index else None
+        )
         try:
             running_summary = run_pass(
                 client=client,
@@ -498,8 +559,12 @@ def summarise_dialogue(input_path: Path, client: Optional[ChatClient] = None) ->
                 pass_index=pass_index,
                 total_passes=TOTAL_PASSES,
                 system_prompt=current_prompt,
+                start_chunk=start_chunk,
                 progress_callback=handle_progress,
             )
+            if resume_pass_marker == pass_index:
+                resume_pass_marker = None
+                resume_chunk_marker = None
         except OpenRouterRateLimitError as exc:
             summary = exc.partial_summary or (running_summary or "")
             summary = summary.strip()
@@ -509,6 +574,19 @@ def summarise_dialogue(input_path: Path, client: Optional[ChatClient] = None) ->
                 last_saved_summary = summary
                 if path is not None:
                     last_saved_path = path
+            store_pass = last_saved_pass if last_saved_pass is not None else pass_index
+            store_chunk = last_saved_chunk
+            store_summary = summary or last_saved_summary
+            if store_summary:
+                _store_resume_state(
+                    input_path,
+                    store_summary,
+                    store_pass,
+                    store_chunk,
+                    last_saved_path or path,
+                )
+                last_saved_pass = store_pass
+                last_saved_chunk = store_chunk
             exc.partial_path = last_saved_path or path
             raise
         except Exception:
@@ -521,12 +599,25 @@ def summarise_dialogue(input_path: Path, client: Optional[ChatClient] = None) ->
                     last_saved_path = path
                     if DEBUG:
                         print(
-                            f"[Summariser] Прогресс сохранён перед ошибкой: {path}"
+                            f"[Summariser] Промежуточный итог сохранён в файл: {path}"
                         )
             elif last_saved_path is not None and DEBUG:
                 print(
-                    f"[Summariser] Используем ранее сохранённый прогресс: {last_saved_path}"
+                    f"[Summariser] Используем ранее сохранённый результат: {last_saved_path}"
                 )
+            store_pass = last_saved_pass if last_saved_pass is not None else pass_index
+            store_chunk = last_saved_chunk
+            store_summary = summary or last_saved_summary
+            if store_summary:
+                _store_resume_state(
+                    input_path,
+                    store_summary,
+                    store_pass,
+                    store_chunk,
+                    last_saved_path or path,
+                )
+                last_saved_pass = store_pass
+                last_saved_chunk = store_chunk
             raise
     final_output = (running_summary or "").strip()
     if final_output:
@@ -542,6 +633,7 @@ def summarise_dialogue(input_path: Path, client: Optional[ChatClient] = None) ->
     else:
         running_summary = final_output
 
+    _clear_resume_state(input_path)
     return running_summary or ""
 
 
@@ -601,6 +693,62 @@ def _auto_gemini_rpm(model_name: str) -> int:
     if "pro" in name:
         return 1
     return 1
+
+
+def _resume_state_path(input_path: Path) -> Path:
+    base = Path(OUTPUT_TEXT).expanduser() if OUTPUT_TEXT else input_path
+    try:
+        resolved = base.expanduser().resolve()
+    except Exception:
+        resolved = base.expanduser()
+    return resolved.parent / f"{resolved.name}.state.json"
+
+
+def _load_resume_state(input_path: Path) -> dict[str, Any]:
+    path = _resume_state_path(input_path)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        if DEBUG:
+            print(f"[Summariser] Resume state read failed: {exc}")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _store_resume_state(
+    input_path: Path,
+    summary: str,
+    pass_index: Optional[int],
+    chunk_index: Optional[int],
+    summary_path: Optional[Path],
+) -> None:
+    payload: dict[str, Any] = {
+        "summary": (summary or "").strip(),
+        "pass_index": int(pass_index) if pass_index is not None else None,
+        "chunk_index": int(chunk_index) if chunk_index is not None else None,
+    }
+    if summary_path:
+        payload["summary_path"] = str(summary_path)
+    path = _resume_state_path(input_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        if DEBUG:
+            print(f"[Summariser] Resume state write failed: {exc}")
+
+
+def _clear_resume_state(input_path: Path) -> None:
+    path = _resume_state_path(input_path)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        if DEBUG:
+            print(f"[Summariser] Resume state cleanup failed: {exc}")
 
 
 def _save_partial_summary(input_path: Path, summary: str) -> Optional[Path]:
