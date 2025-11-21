@@ -61,6 +61,14 @@ PARALLEL_PROCESSES: int = 0                  # Отключено: всё в о�
 DEBUG: bool = True                           # Отладочные принты
 # =====================================================================================
 
+# ����� �������� ���᫥ ����� �������.
+SPEAKER_LABEL_OVERRIDES: dict[str, str] = {
+    "1-ilya626": "Мастер игры, НПЦ и Мир",
+    "2-soorkade": "Церара (эладринка)",
+    "4-maens": "Мурди (дворф, бард)",
+    "3-little_doll": "Йоруэль",
+}
+
 import json, os, sys, gc, io, tempfile
 from pathlib import Path
 from typing import List, Optional
@@ -124,6 +132,30 @@ def _format_ts(sec: float) -> str:
     s = ms // 1000
     ms %= 1000
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+def _resolve_speaker_label(
+    audio_name: str,
+    *,
+    mapping: Optional[dict[str, str]] = None,
+) -> str:
+    """Map raw audio filename to a readable speaker/role label."""
+    mapping = mapping or SPEAKER_LABEL_OVERRIDES
+    base_name = Path(audio_name or "").name
+    stem = Path(base_name).stem if base_name else ""
+    candidates = []
+    if stem:
+        candidates.extend([stem, stem.lower()])
+    if base_name:
+        candidates.extend([base_name, base_name.lower()])
+    seen: set[str] = set()
+    for key in candidates:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        label = mapping.get(key)
+        if label:
+            return label
+    return stem or base_name or "audio"
 
 def _read_audio_16k_mono(path: Path, target_sr: int = 16000) -> tuple[np.ndarray, int]:
     """Read arbitrary audio (WAV/FLAC/etc.) and convert to mono 16 kHz float32."""
@@ -788,7 +820,7 @@ def main():
 
                 audio_field = seg.get("audio") or ""
                 audio_name = os.path.basename(audio_field)
-                speaker = Path(audio_name).stem or audio_name or "audio"
+                speaker = _resolve_speaker_label(audio_name)
 
                 text_value = seg.get("text")
                 if text_value is None:

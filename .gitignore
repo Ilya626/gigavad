@@ -19,7 +19,9 @@ openrouter_raw
 records_2.rar
 records.rar
 dataset_prep.ipynb
+dataset_prep_v2.ipynb
 prompts
+ruadapt_triples_format
 
 # Local configuration for the summariser
 summarize_config.ini
