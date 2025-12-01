@@ -4,16 +4,16 @@
 from __future__ import annotations
 
 # =============================== ГЛОБАЛЬНЫЕ НАСТРОЙКИ ===============================
-INPUT_DIALOG: str = "out\\2025-11-14\\dialog_2025-11-14.jsonl"              # Финальный текст диалога (dialog_*.txt)
+INPUT_DIALOG: str = "out\\2025-11-28\\dialog_2025-11-28.jsonl"              # Финальный текст диалога (dialog_*.txt)
 CHEAT_SHEET_FILE: str = "out\\Cheatsheet.txt"                     # Готовый cheat sheet (TXT), "" — не отправлять
-OUTPUT_TEXT: str = "out\\2025-11-14\\summary_dialog_2025-11-14.txt"                         # Путь для финального текста ("" — пропустить)
+OUTPUT_TEXT: str = "out\\2025-11-28\\summary_dialog_2025-11-28.txt"                         # Путь для финального текста ("" — пропустить)
 
 MODEL_PROVIDER: str = "gemini"               # "openrouter" или "gemini"
 MODEL_NAME: str = "gemini-2.5-pro"  # Имя модели выбранного провайдера
 CHUNK_COUNT: int = 5                           # Сколько окон по ~20%
 CHUNK_OVERLAP: int = 1                         # Перекрытие окон в сегментах
 TOTAL_PASSES: int = 2                          # Первый прогон + уточнение
-MAX_TOKENS: int = 20000                         # Лимит токенов на ответ
+MAX_TOKENS: int = 40000                         # Лимит токенов на ответ
 TEMPERATURE: float = 0.5                       # Температура модели
 REQUEST_TIMEOUT: int = 210                     # Таймаут HTTP-запроса, сек
 DRY_RUN: bool = False                          # True — не звонить в OpenRouter
